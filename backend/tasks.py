@@ -100,7 +100,7 @@ async def run_segment_fix_job(job, setp):
     from pipeline import regenerate_segment
     payload = job.get("payload") or {}
     await regenerate_segment(job["ref_id"], int(payload.get("index", 0)), setp,
-                             kind=str(payload.get("kind") or "all"))
+                             kind=str(payload.get("kind") or "all"), notes=str(payload.get("notes") or ""))
 
 
 async def run_edit_request_job(job, setp):

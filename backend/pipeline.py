@@ -382,8 +382,9 @@ async def produce_video(story_id: str, setp, job_id=""):
     )
 
 
-async def regenerate_segment(story_id: str, index: int, setp, kind: str = "all"):
+async def regenerate_segment(story_id: str, index: int, setp, kind: str = "all", notes: str = ""):
     from services import router
+    from services.generation import generation_context
     story = await _load_story(story_id)
     channel = await _load_channel(story)
     chunks = (story.get("script") or {}).get("chunks") or []
@@ -444,9 +445,16 @@ async def regenerate_segment(story_id: str, index: int, setp, kind: str = "all")
             "Clear subject and readable facial expressions, natural anatomy and hands, strong foreground/midground/background separation, "
             "coherent lighting, rich material detail, cinematic composition, no text, no watermark. Do not redesign identity, clothing, palette, or medium."
         )
-        res = await router.image(visual_prompt, frame, ref_image=char_path if char_path.exists() else None,
-                                 session=f"frame-{aid}-{index}-r", query_hint=chunk.get("visual"),
-                                 require_reference=True, quality_required=True, segment_index=index)
+        gen_ctx = generation_context.get()
+        if gen_ctx.get("job_id"):  # tells the Studio worker to make a new revision (with these comments)
+            gen_ctx["regenerate"], gen_ctx["feedback"] = index, notes
+        try:
+            res = await router.image(visual_prompt, frame, ref_image=char_path if char_path.exists() else None,
+                                     session=f"frame-{aid}-{index}-r", query_hint=chunk.get("visual"),
+                                     require_reference=True, quality_required=True, segment_index=index)
+        finally:
+            gen_ctx.pop("regenerate", None)
+            gen_ctx.pop("feedback", None)
         if res.get("provider") not in ("procedural",):
             await _save_cost(story_id, "image", media.IMAGE_PRICE)
 

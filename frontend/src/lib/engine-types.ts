@@ -1,4 +1,4 @@
-export type ImageEngine = 'auto' | 'gemini' | 'emergent' | 'openai' | 'stability' | 'fal_flux' | 'replicate_flux' | 'hf_flux' | 'studio';
+export type ImageEngine = 'auto' | 'gemini' | 'openai' | 'stability' | 'fal_flux' | 'replicate_flux' | 'hf_flux' | 'studio';
 export type VideoEngine = 'auto' | 'kenburns' | 'gemini_veo' | 'studio';
 export interface EngineChoice { image: ImageEngine | null; video: VideoEngine | null }
 export interface EngineSettings { image: ImageEngine; video: VideoEngine; studio_base_url: string; studio_poll_seconds: number; studio_timeout_seconds: number }

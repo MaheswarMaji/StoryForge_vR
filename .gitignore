@@ -81,8 +81,6 @@ memory/test_credentials.md
 # Mobile development
 android-sdk/
 
-# overlay black-box crash/user-report dumps — session data, never history
-**/.emergent/recordings/
 frontend/node_modules/.cache/default-development/1.pack
 frontend/node_modules/.cache/default-development/4.pack
 frontend/node_modules/.cache/default-development/7.pack
@@ -93,7 +91,11 @@ backend/media/final/6aa616a70b6da578466afad5.mp4
 .env
 .env.*
 *.env
+!.env.example
 credentials.json
 *.key
 .credentials
 frontend/node_modules/.cache/default-development/0.pack
+
+# local object storage (uploaded PDFs, stitch mirrors)
+storage/

@@ -9,10 +9,9 @@ import { toast } from "sonner";
 import { EngineSettingsCard, GenerationDiagnostics } from '../components/MediaEngines';
 
 const KEY_LABELS = {
-  STUDIO_API_TOKEN: "Your Studio — backend-only Bearer token (add after installing its HTTP API)",
+  STUDIO_API_TOKEN: "Your Studio — only for a future HTTP API; not needed for the local worker on server27",
   OPENAI_API_KEY: "OpenAI (DALL·E / GPT Image 1 + LLM fallback)",
   GEMINI_API_KEY: "Google Gemini (Veo video, TTS, image, LLM)",
-  EMERGENT_LLM_KEY: "Emergent Universal Key (LLM fallback)",
   HF_TOKEN: "Hugging Face (free hosted Qwen-72B text fallback; image API deprecated by HF)",
   FAL_KEY: "fal.ai (FLUX / SDXL / Juggernaut images, Wan / CogVideoX clips)",
   REPLICATE_API_TOKEN: "Replicate (FLUX images, Wan 2.1 clips)",

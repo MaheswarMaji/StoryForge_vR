@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from auth import optional_user_id
+from auth import admin_emails, optional_user_id
 from db import db
 from job_queue import HEARTBEAT, QUEUE_PAUSED, enqueue
 from models import Book, Story, Channel, utcnow
@@ -21,6 +21,48 @@ def fix(doc):
     if doc and isinstance(doc.get("_id"), object) and not isinstance(doc.get("_id"), str):
         doc["_id"] = str(doc["_id"])
     return doc
+
+
+# ---------- ownership helpers ----------
+async def _current_user(request: Request) -> dict:
+    """Return the authenticated user (or {}) — used to enforce content ownership."""
+    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
+    if not uid:
+        return {}
+    user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or {}
+    if not user:
+        return {"user_id": uid}
+    user["is_admin"] = (user.get("role") == "admin"
+                       or user.get("email", "").lower() in admin_emails())
+    return user
+
+
+async def _owner_filter(request: Request) -> dict:
+    """Return a Mongo filter enforcing per-account content isolation (admins bypass)."""
+    user = await _current_user(request)
+    if user.get("is_admin"):
+        return {}
+    uid = user.get("user_id") or ""
+    # Empty owner_id string means "legacy pre-scoping data" — only the owner and admins
+    # will see anything.  Anonymous requests see nothing.
+    return {"owner_id": uid}
+
+
+async def _owned_story(request: Request, story_id: str) -> dict:
+    """Fetch a story only if the caller is its owner (or an admin).  404 otherwise."""
+    filt = {"_id": story_id, **(await _owner_filter(request))}
+    story = await db.stories.find_one(filt)
+    if not story:
+        raise HTTPException(404, "story not found")
+    return story
+
+
+async def _owned_book(request: Request, book_id: str) -> dict:
+    filt = {"_id": book_id, **(await _owner_filter(request))}
+    book = await db.books.find_one(filt)
+    if not book:
+        raise HTTPException(404, "book not found")
+    return book
 
 
 # ---------- health ----------
@@ -71,9 +113,9 @@ async def upload_book(request: Request, file: UploadFile = File(...), channel_id
 
 
 @router.get("/books")
-async def list_books():
+async def list_books(request: Request):
     out = []
-    async for b in db.books.find().sort("created_at", -1):
+    async for b in db.books.find(await _owner_filter(request)).sort("created_at", -1):
         story_count = await db.stories.count_documents({"book_id": b["_id"]})
         d = Book.from_mongo(b).model_dump()
         d["story_count"] = story_count
@@ -82,10 +124,8 @@ async def list_books():
 
 
 @router.get("/books/{book_id}")
-async def get_book(book_id: str):
-    b = await db.books.find_one({"_id": book_id})
-    if not b:
-        raise HTTPException(404, "book not found")
+async def get_book(book_id: str, request: Request):
+    b = await _owned_book(request, book_id)
     stories = []
     async for s in db.stories.find({"book_id": book_id}).sort("created_at", 1):
         stories.append(Story.from_mongo(s).model_dump())
@@ -97,10 +137,8 @@ async def get_book(book_id: str):
 
 # ---------- stories ----------
 @router.post("/books/{book_id}/reocr")
-async def reocr_book(book_id: str):
-    b = await db.books.find_one({"_id": book_id})
-    if not b:
-        raise HTTPException(404, "book not found")
+async def reocr_book(book_id: str, request: Request):
+    b = await _owned_book(request, book_id)
     if b["status"] in ("ocr_running", "segmenting"):
         raise HTTPException(409, "OCR already in progress")
     await db.books.update_one({"_id": book_id}, {"$set": {
@@ -111,8 +149,8 @@ async def reocr_book(book_id: str):
 
 
 @router.get("/stories")
-async def list_stories(channel_id: Optional[str] = None, status: Optional[str] = None):
-    q = {}
+async def list_stories(request: Request, channel_id: Optional[str] = None, status: Optional[str] = None):
+    q = dict(await _owner_filter(request))
     if channel_id and channel_id != "all":
         q["channel_id"] = channel_id
     if status and status != "all":
@@ -124,18 +162,14 @@ async def list_stories(channel_id: Optional[str] = None, status: Optional[str] =
 
 
 @router.get("/stories/{story_id}")
-async def get_story(story_id: str):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def get_story(story_id: str, request: Request):
+    s = await _owned_story(request, story_id)
     return Story.from_mongo(s).model_dump()
 
 
 @router.post("/stories/{story_id}/script")
-async def gen_script(story_id: str):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def gen_script(story_id: str, request: Request):
+    s = await _owned_story(request, story_id)
     if s["status"] in ("scripting",):
         raise HTTPException(409, "script already being generated")
     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "scripting", "error": ""}})
@@ -144,10 +178,8 @@ async def gen_script(story_id: str):
 
 
 @router.post("/stories/{story_id}/produce")
-async def produce(story_id: str):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def produce(story_id: str, request: Request):
+    s = await _owned_story(request, story_id)
     if not s.get("script", {}).get("chunks"):
         raise HTTPException(409, "generate the script first")
     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "rendering", "stage": "Queued", "error": ""}})
@@ -156,8 +188,9 @@ async def produce(story_id: str):
 
 
 @router.post("/stories/{story_id}/stop")
-async def stop_story(story_id: str):
+async def stop_story(story_id: str, request: Request):
     """Cancel the running/queued produce (or improve) job for this story."""
+    await _owned_story(request, story_id)
     j = await db.jobs.find_one(
         {"ref_id": story_id, "type": {"$in": ["produce", "improve", "segment_fix", "edit_request"]},
          "status": {"$in": ["queued", "running"]}},
@@ -175,18 +208,26 @@ async def stop_story(story_id: str):
 
 
 @router.post("/jobs/{job_id}/cancel")
-async def cancel_job_endpoint(job_id: str):
+async def cancel_job_endpoint(job_id: str, request: Request):
     from job_queue import cancel_job
     j = await db.jobs.find_one({"_id": job_id})
     if not j:
         raise HTTPException(404, "job not found")
+    ref_id = j.get("ref_id") or ""
+    if ref_id and ref_id != "system":
+        # Only the owner (or admin) may cancel a job attached to a story.
+        await _owned_story(request, ref_id)
+    else:
+        user = await _current_user(request)
+        if not user.get("is_admin"):
+            raise HTTPException(404, "job not found")
     await db.jobs.update_one({"_id": job_id, "status": {"$in": ["queued", "running"]}},
                              {"$set": {"status": "cancelled", "error": "stopped by user",
                                        "finished_at": utcnow()}})
     cancel_job(job_id)
-    if j.get("ref_id") and j["ref_id"] != "system":
+    if ref_id and ref_id != "system":
         await db.stories.update_one(
-            {"_id": j["ref_id"], "status": "rendering"},
+            {"_id": ref_id, "status": "rendering"},
             {"$set": {"status": "script_ready", "stage": "Stopped by user", "error": ""}})
     return {"ok": True}
 
@@ -232,13 +273,12 @@ async def put_scheduler(body: SchedulerBody):
 
 class SegmentRegenerateBody(BaseModel):
     kind: str = "all"  # script | voice | visual | all
+    notes: str = ""    # optional review comments (used by the Studio image worker)
 
 
 @router.post("/stories/{story_id}/segments/{index}/regenerate")
-async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegenerateBody] = None):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def regen_segment(story_id: str, index: int, request: Request, body: Optional[SegmentRegenerateBody] = None):
+    s = await _owned_story(request, story_id)
     chunks = (s.get("script") or {}).get("chunks") or []
     if index < 0 or index >= len(chunks):
         raise HTTPException(400, "invalid segment index")
@@ -246,15 +286,13 @@ async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegener
     if kind not in {"script", "voice", "visual", "all"}:
         raise HTTPException(400, "kind must be script|voice|visual|all")
     job_id = await enqueue("segment_fix", story_id, f"Regenerate {kind} · segment {index + 1}",
-                           payload={"index": index, "kind": kind})
+                           payload={"index": index, "kind": kind, "notes": (body.notes if body else "").strip()[:2000]})
     return {"job_id": job_id}
 
 
 @router.post("/stories/{story_id}/improve")
-async def improve_story(story_id: str):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def improve_story(story_id: str, request: Request):
+    s = await _owned_story(request, story_id)
     if not s.get("script", {}).get("chunks"):
         raise HTTPException(409, "generate the script first")
     if len(s.get("improvements") or []) >= 2:
@@ -278,7 +316,7 @@ class CreateBody(BaseModel):
 
 
 @router.post("/stories/create")
-async def create_story(body: CreateBody):
+async def create_story(body: CreateBody, request: Request):
     from script_parser import parse_scene_script
     from services.video_types import VIDEO_TYPES
     cfg = VIDEO_TYPES.get(body.video_type)
@@ -303,7 +341,19 @@ async def create_story(body: CreateBody):
     parsed = parse_scene_script(body.source_text)
     supplied_title = body.title.strip() or ((parsed or {}).get("title") or "")
     bible = ((parsed or {}).get("character_sheet") or "").strip()
+    owner_id = await optional_user_id(request)
+    script_payload = {}
+    if parsed:
+        script_payload = {
+            "chunks": parsed["chunks"],
+            "production_notes": parsed["production_notes"],
+            "imported_verbatim": True,
+            "character_sheet": {"anchor": bible},
+            "missing": parsed["missing"],
+            "is_partial": parsed["is_partial"],
+        }
     story = Story(book_id=f"prompt-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
+                  owner_id=owner_id,
                   title_hindi=supplied_title, title_english=supplied_title[:100],
                   source="Pasted script / prompt", category=cfg["name"],
                   target_seconds=target, mode=mode,
@@ -311,18 +361,21 @@ async def create_story(body: CreateBody):
                   emotional_tone=cfg["tone"][:60], target_audience=cfg["audience"],
                   visual_style=cfg["style_prefix"][:120], estimated_length=f"{target}s",
                   status="script_ready" if parsed else "draft",
-                  stage=f"Loaded {len(parsed['chunks'])} supplied scenes" if parsed else "",
-                  script={"chunks": parsed["chunks"], "production_notes": parsed["production_notes"],
-                          "imported_verbatim": True,
-                          "character_sheet": {"anchor": bible}} if parsed else {},
+                  stage=(f"Loaded {len(parsed['chunks'])} supplied scenes"
+                         + (" · gaps queued for AI fill" if parsed and parsed["is_partial"] else "")
+                         if parsed else ""),
+                  script=script_payload,
                   character_sheet={"anchor": bible, "text": bible, "locked": bool(bible),
                                    "visuals_stale": False, "version": 1} if parsed else {})
     await db.stories.insert_one(story.to_mongo())
     if parsed:
         return {"story_id": story.id, "job_id": None, "imported": True,
-                "imported_segments": len(parsed["chunks"])}
+                "imported_segments": len(parsed["chunks"]),
+                "is_partial": parsed["is_partial"],
+                "missing": parsed["missing"]}
     job_id = await enqueue("script", story.id, f"Script: {supplied_title[:40] or story.id}")
-    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0}
+    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0,
+            "is_partial": False, "missing": {"voiceover": [], "visual": [], "video_prompt": []}}
 
 
 @router.get("/video-types")
@@ -336,10 +389,8 @@ class ScriptPatchBody(BaseModel):
 
 
 @router.patch("/stories/{story_id}/script")
-async def patch_script(story_id: str, body: ScriptPatchBody):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def patch_script(story_id: str, body: ScriptPatchBody, request: Request):
+    s = await _owned_story(request, story_id)
     if s["status"] == "rendering":
         raise HTTPException(409, "pipeline busy — wait for the render to finish")
     chunks = (s.get("script") or {}).get("chunks") or []
@@ -375,12 +426,10 @@ class ConfigBody(BaseModel):
 
 
 @router.put("/stories/{story_id}/config")
-async def story_config(story_id: str, body: ConfigBody):
+async def story_config(story_id: str, body: ConfigBody, request: Request):
     import shutil
 
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+    s = await _owned_story(request, story_id)
     if s["status"] == "rendering":
         raise HTTPException(409, "pipeline busy")
     patch = {}
@@ -403,10 +452,8 @@ class CharacterSheetBody(BaseModel):
 
 
 @router.patch("/stories/{story_id}/character-sheet")
-async def update_character_sheet(story_id: str, body: CharacterSheetBody):
-    story = await db.stories.find_one({"_id": story_id})
-    if not story:
-        raise HTTPException(404, "story not found")
+async def update_character_sheet(story_id: str, body: CharacterSheetBody, request: Request):
+    story = await _owned_story(request, story_id)
     if story.get("status") == "rendering":
         raise HTTPException(409, "pipeline busy — wait for the render to finish")
     anchor = body.anchor.strip()
@@ -436,10 +483,8 @@ class ReviewBody(BaseModel):
 
 
 @router.post("/stories/{story_id}/review")
-async def review(story_id: str, body: ReviewBody):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def review(story_id: str, body: ReviewBody, request: Request):
+    s = await _owned_story(request, story_id)
     mapping = {"approve": "approved", "reject": "rejected", "request_edits": "edits_requested"}
     if body.action not in mapping:
         raise HTTPException(400, "action must be approve|reject|request_edits")
@@ -455,17 +500,34 @@ async def review(story_id: str, body: ReviewBody):
     if body.action == "request_edits":
         job_id = await enqueue("edit_request", story_id, "Apply requested story edits",
                                payload={"notes": body.notes.strip()})
-    response = await get_story(story_id)
+    response = await get_story(story_id, request)
     if isinstance(response, dict):
         response["edit_job_id"] = job_id
     return response
 
 
 # ---------- jobs & dashboard ----------
+async def _visible_story_ids(request: Request) -> Optional[set]:
+    """Return the set of story IDs the caller can see, or ``None`` for admins."""
+    user = await _current_user(request)
+    if user.get("is_admin"):
+        return None
+    uid = user.get("user_id") or ""
+    ids: set[str] = set()
+    async for s in db.stories.find({"owner_id": uid}, {"_id": 1}):
+        ids.add(s["_id"])
+    return ids
+
+
 @router.get("/jobs")
-async def list_jobs(limit: int = 30):
+async def list_jobs(request: Request, limit: int = 30):
+    ids = await _visible_story_ids(request)
+    filt: dict = {} if ids is None else {"$or": [
+        {"ref_id": {"$in": list(ids)}},
+        {"ref_id": "system"},
+    ]}
     out = []
-    async for j in db.jobs.find().sort("created_at", -1).limit(min(limit, 100)):
+    async for j in db.jobs.find(filt).sort("created_at", -1).limit(min(limit, 100)):
         d = fix(dict(j))
         for f in ("created_at", "started_at", "finished_at"):
             if isinstance(d.get(f), datetime):
@@ -475,22 +537,31 @@ async def list_jobs(limit: int = 30):
 
 
 @router.get("/dashboard")
-async def dashboard():
+async def dashboard(request: Request):
+    story_filter = await _owner_filter(request)
+    ids = await _visible_story_ids(request)
+    if ids is None:
+        jobs_filter: dict = {}
+    else:
+        jobs_filter = {"$or": [{"ref_id": {"$in": list(ids)}}, {"ref_id": "system"}]}
+
     status_counts = {}
-    async for s in db.stories.find({}, {"status": 1}):
+    async for s in db.stories.find(story_filter, {"status": 1}):
         status_counts[s["status"]] = status_counts.get(s["status"], 0) + 1
 
-    pipeline_t = [{"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
-                              "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
-                              "n": {"$sum": 1},
-                              "produced": {"$sum": {"$cond": [
-                                  {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
-                                  1, 0]}}}}]
+    pipeline_t = [
+        {"$match": story_filter} if story_filter else {"$match": {}},
+        {"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
+                    "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
+                    "n": {"$sum": 1},
+                    "produced": {"$sum": {"$cond": [
+                        {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
+                        1, 0]}}}}]
     agg = await db.stories.aggregate(pipeline_t).to_list(1)
     cost = agg[0] if agg else {"llm": 0, "tts": 0, "image": 0, "total": 0, "n": 0, "produced": 0}
     avg = round(cost["total"] / cost["produced"], 3) if cost["produced"] else 0
     jobs = []
-    async for j in db.jobs.find().sort("created_at", -1).limit(25):
+    async for j in db.jobs.find(jobs_filter).sort("created_at", -1).limit(25):
         d = fix(dict(j))
         for f in ("created_at", "started_at", "finished_at"):
             if isinstance(d.get(f), datetime):
@@ -498,18 +569,19 @@ async def dashboard():
         jobs.append(d)
 
     job_counts = {}
-    async for j in db.jobs.find({}, {"status": 1}):
+    async for j in db.jobs.find(jobs_filter, {"status": 1}):
         job_counts[j["status"]] = job_counts.get(j["status"], 0) + 1
 
     beat_coverage = {"hook": 0, "story": 0, "twist": 0, "climax": 0, "action": 0, "lesson": 0}
-    async for s in db.stories.find({"script.chunks": {"$exists": True, "$ne": []}}, {"script.chunks.beat": 1}):
+    async for s in db.stories.find({**story_filter, "script.chunks": {"$exists": True, "$ne": []}},
+                                   {"script.chunks.beat": 1}):
         seen = {c.get("beat") for c in s.get("script", {}).get("chunks", []) if isinstance(c, dict)}
         for b in beat_coverage:
             if b in seen:
                 beat_coverage[b] += 1
 
     recent = []
-    async for s in db.stories.find().sort("updated_at", -1).limit(8):
+    async for s in db.stories.find(story_filter).sort("updated_at", -1).limit(8):
         recent.append(Story.from_mongo(s).model_dump())
 
     return {
@@ -518,7 +590,7 @@ async def dashboard():
                  "image": round(cost["image"], 3), "total": round(cost["total"], 3),
                  "avg_per_video": avg, "videos_produced": cost["produced"], "n": cost["n"]},
         "beat_coverage": beat_coverage,
-        "queue": {"depth": await db.jobs.count_documents({"status": "queued"}),
+        "queue": {"depth": await db.jobs.count_documents({**jobs_filter, "status": "queued"}),
                   "active": HEARTBEAT["active"],
                   "workers": HEARTBEAT["workers"],
                   "paused": QUEUE_PAUSED["paused"],
@@ -531,7 +603,8 @@ async def dashboard():
 
 # ---------- bulk curation ----------
 @router.post("/books/{book_id}/script-all")
-async def script_all(book_id: str):
+async def script_all(book_id: str, request: Request):
+    await _owned_book(request, book_id)
     n = 0
     async for s in db.stories.find({"book_id": book_id, "status": "draft"}, {"_id": 1, "title_english": 1}):
         await enqueue("script", s["_id"], f"Script: {s.get('title_english', '')[:40]}")
@@ -546,10 +619,11 @@ class BatchBody(BaseModel):
 
 
 @router.post("/stories/batch-produce")
-async def batch_produce(body: BatchBody):
+async def batch_produce(body: BatchBody, request: Request):
+    owner_filter = await _owner_filter(request)
     queued = []
     for sid in body.ids[:30]:
-        s = await db.stories.find_one({"_id": sid})
+        s = await db.stories.find_one({"_id": sid, **owner_filter})
         if not s or not s.get("script", {}).get("chunks"):
             continue
         if s["status"] in ("rendering",):
@@ -568,10 +642,8 @@ class PublishBody(BaseModel):
 
 
 @router.post("/stories/{story_id}/publish")
-async def publish_story(story_id: str, body: PublishBody):
-    s = await db.stories.find_one({"_id": story_id})
-    if not s:
-        raise HTTPException(404, "story not found")
+async def publish_story(story_id: str, body: PublishBody, request: Request):
+    await _owned_story(request, story_id)
     if body.platform not in ("youtube", "instagram"):
         raise HTTPException(400, "platform must be youtube|instagram")
     job_id = await enqueue("publish", story_id, f"Publish to {platform_label(body.platform)}",
@@ -631,7 +703,7 @@ async def engagement_sync():
 
 
 # ---------- integration settings ----------
-ALLOWED_VAULT_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "EMERGENT_LLM_KEY", "FAL_KEY", "HF_TOKEN",
+ALLOWED_VAULT_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "FAL_KEY", "HF_TOKEN",
                       "REPLICATE_API_TOKEN", "PEXELS_API_KEY", "STABILITY_API_KEY", "YOUTUBE_CLIENT_ID",
                       "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN", "INSTAGRAM_ACCESS_TOKEN",
                       "INSTAGRAM_USER_ID", "STUDIO_API_TOKEN"}
@@ -742,9 +814,10 @@ async def news_fetch():
 
 
 @router.get("/news/items")
-async def news_items():
+async def news_items(request: Request):
     out = []
-    async for s in db.stories.find({"policy": {"$ne": {}}}).sort("created_at", -1).limit(60):
+    q = {"policy": {"$ne": {}}, **(await _owner_filter(request))}
+    async for s in db.stories.find(q).sort("created_at", -1).limit(60):
         out.append(Story.from_mongo(s).model_dump())
     return out
 
@@ -808,11 +881,11 @@ async def stitch_upload(file: UploadFile = File(...)):
     dst.write_bytes(data)
     kind = "video" if ext in STITCH_VIDEO_EXTS else "image"
     from services import media, storage
-    try:  # mirror the upload to object storage so the local copy isn't the only one
+    try:  # keep a second copy in the storage dir so the media dir isn't the only one
         storage.put_object(f"{storage.APP_NAME}/stitch/{media_id}{ext}", data,
                            "video/mp4" if kind == "video" else "image/jpeg")
     except Exception as e:
-        print(f"[stitch] object-storage mirror failed (keeping local copy): {str(e)[:120]}", flush=True)
+        print(f"[stitch] storage copy failed (keeping local copy): {str(e)[:120]}", flush=True)
     return {"media_id": media_id, "kind": kind, "size": len(data),
             "duration": round(media.ffprobe_duration(dst), 2) if kind == "video" else None}
 
@@ -833,7 +906,7 @@ class StitchBody(BaseModel):
 
 
 @router.post("/stitch")
-async def stitch_create(body: StitchBody):
+async def stitch_create(body: StitchBody, request: Request):
     import re
 
     from services.video_types import VIDEO_TYPES
@@ -881,6 +954,7 @@ async def stitch_create(body: StitchBody):
         ch = await db.channels.find_one({"key": key})
 
     story = Story(book_id=f"stitch-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
+                  owner_id=await optional_user_id(request),
                   title_hindi=body.title.strip(),
                   title_english=body.title.strip()[:100] or "My stitched video",
                   source="Uploaded images & clips", category=cfg["name"], mode="stitch",

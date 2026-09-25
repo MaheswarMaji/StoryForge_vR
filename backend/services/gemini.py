@@ -54,10 +54,6 @@ def openai_key():
     return (os.environ.get("OPENAI_API_KEY") or "").strip()
 
 
-def emergent_key():
-    return (os.environ.get("EMERGENT_LLM_KEY") or "").strip()
-
-
 def _retry_wait(text, attempt):
     m = re.search(r"retry in\s*([\d.]+)s", text)
     return float(m.group(1)) + 2 if m else 18.0 + 8 * attempt

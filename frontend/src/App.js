@@ -1,9 +1,9 @@
 import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ChannelProvider } from "@/lib/api";
 import Layout from "@/components/Layout";
-import AuthCallback from "@/components/AuthCallback";
+import ProtectedRoute from "@/components/ProtectedRoute";
 import LoginPage from "@/pages/LoginPage";
 import DashboardPage from "@/pages/DashboardPage";
 import UploadPage from "@/pages/UploadPage";
@@ -19,13 +19,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } });
 
 function AppRouter() {
-  const location = useLocation();
-  // Process the OAuth session_id BEFORE anything else (avoids the provider race condition)
-  if (location.hash?.includes("session_id=")) return <AuthCallback />;
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route element={<Layout />}>
+      <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/upload" element={<UploadPage />} />

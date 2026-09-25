@@ -5,7 +5,7 @@ import subprocess
 import requests
 import pytest
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://tale-video-engine.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8001").rstrip("/")
 ADMIN_BEARER = "qa_admin_test-admin-4447"
 H = {"Authorization": f"Bearer {ADMIN_BEARER}", "Content-Type": "application/json"}
 

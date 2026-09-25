@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
-from auth import _token_from, _utc, admin_emails
+from auth import _token_from, _utc, is_admin_email
 from db import db
 
 admin_router = APIRouter(prefix="/api/admin")
@@ -32,7 +32,7 @@ async def verify_admin(request: Request):
     user = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0})
     if not user:
         raise HTTPException(401, "user not found")
-    if not (user.get("role") == "admin" or user.get("email", "").lower() in admin_emails()):
+    if not is_admin_email(user.get("email")):
         raise HTTPException(403, "admin access required")
     request.state.user_id = user["user_id"]
     return user

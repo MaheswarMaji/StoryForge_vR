@@ -2,36 +2,24 @@ import asyncio
 import json
 import os
 import re
-import uuid
 from pathlib import Path
-
-from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 from services.keys import candidate_keys
 
-MODEL = ("openai", "gpt-5.4")
+# Override with OPENAI_TEXT_MODEL in backend/.env to use any chat model your OpenAI key can access.
+MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-5.4")
 LLM_IN_PRICE = 2.5e-6   # $ per input token (estimate)
 LLM_OUT_PRICE = 1.0e-5  # $ per output token (estimate)
 
 
-def _chat_for(key):
-    chat = LlmChat(
-        api_key=key,
-        session_id=f"s-{uuid.uuid4().hex[:10]}",
-        system_message="",
-    ).with_model(*MODEL)
-    return chat
+async def _openai_text(key: str, system: str, prompt: str) -> str:
+    """One chat completion through the official OpenAI SDK."""
+    from openai import AsyncOpenAI
 
-
-def _extract_text(resp):
-    if resp is None:
-        return ""
-    if isinstance(resp, str):
-        return resp
-    content = getattr(resp, "content", None)
-    if isinstance(content, str):
-        return content
-    return str(resp)
+    client = AsyncOpenAI(api_key=key, timeout=180)
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+    resp = await client.chat.completions.create(model=MODEL, messages=messages)
+    return resp.choices[0].message.content or ""
 
 
 def estimate_llm_cost(prompt: str, response: str) -> float:
@@ -147,21 +135,15 @@ async def ask_json(system: str, prompt: str, session: str = "job", retries: int 
                 last_err = e
         print(f"[llm] gemini chain failed: {str(last_err)[:120]}", flush=True)
 
-    # 2) OpenAI-compatible keys via LlmChat (emergent first: funded universal key)
-    keys = [k for k in (gemini.emergent_key(), gemini.openai_key()) if k]
+    # 2) OpenAI (official SDK) with your own OPENAI_API_KEY
+    keys = [k for k in (gemini.openai_key(),) if k]
     for attempt in range(retries + 1):
         for key in keys:
             try:
-                chat = LlmChat(
-                    api_key=key,
-                    session_id=f"{session}-{uuid.uuid4().hex[:8]}",
-                    system_message=system,
-                ).with_model(*MODEL)
                 msg_text = prompt if attempt == 0 else (
                     prompt + "\n\nCRITICAL: respond with ONLY a single valid JSON object/array. No markdown, no commentary."
                 )
-                resp = await chat.send_message(UserMessage(text=msg_text))
-                txt = _extract_text(resp)
+                txt = await _openai_text(key, system, msg_text)
                 return parse_json(txt)
             except Exception as e:
                 last_err = e

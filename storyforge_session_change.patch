@@ -1,0 +1,795 @@
+diff --git a/backend/routes.py b/backend/routes.py
+index ee12979..a0f196a 100644
+--- a/backend/routes.py
++++ b/backend/routes.py
+@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
+ from fastapi.responses import FileResponse, JSONResponse
+ from pydantic import BaseModel
+ 
+-from auth import optional_user_id
++from auth import admin_emails, optional_user_id
+ from db import db
+ from job_queue import HEARTBEAT, QUEUE_PAUSED, enqueue
+ from models import Book, Story, Channel, utcnow
+@@ -23,6 +23,48 @@ def fix(doc):
+     return doc
+ 
+ 
++# ---------- ownership helpers ----------
++async def _current_user(request: Request) -> dict:
++    """Return the authenticated user (or {}) — used to enforce content ownership."""
++    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
++    if not uid:
++        return {}
++    user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or {}
++    if not user:
++        return {"user_id": uid}
++    user["is_admin"] = (user.get("role") == "admin"
++                       or user.get("email", "").lower() in admin_emails())
++    return user
++
++
++async def _owner_filter(request: Request) -> dict:
++    """Return a Mongo filter enforcing per-account content isolation (admins bypass)."""
++    user = await _current_user(request)
++    if user.get("is_admin"):
++        return {}
++    uid = user.get("user_id") or ""
++    # Empty owner_id string means "legacy pre-scoping data" — only the owner and admins
++    # will see anything.  Anonymous requests see nothing.
++    return {"owner_id": uid}
++
++
++async def _owned_story(request: Request, story_id: str) -> dict:
++    """Fetch a story only if the caller is its owner (or an admin).  404 otherwise."""
++    filt = {"_id": story_id, **(await _owner_filter(request))}
++    story = await db.stories.find_one(filt)
++    if not story:
++        raise HTTPException(404, "story not found")
++    return story
++
++
++async def _owned_book(request: Request, book_id: str) -> dict:
++    filt = {"_id": book_id, **(await _owner_filter(request))}
++    book = await db.books.find_one(filt)
++    if not book:
++        raise HTTPException(404, "book not found")
++    return book
++
++
+ # ---------- health ----------
+ @router.get("/")
+ async def root():
+@@ -71,9 +113,9 @@ async def upload_book(request: Request, file: UploadFile = File(...), channel_id
+ 
+ 
+ @router.get("/books")
+-async def list_books():
++async def list_books(request: Request):
+     out = []
+-    async for b in db.books.find().sort("created_at", -1):
++    async for b in db.books.find(await _owner_filter(request)).sort("created_at", -1):
+         story_count = await db.stories.count_documents({"book_id": b["_id"]})
+         d = Book.from_mongo(b).model_dump()
+         d["story_count"] = story_count
+@@ -82,10 +124,8 @@ async def list_books():
+ 
+ 
+ @router.get("/books/{book_id}")
+-async def get_book(book_id: str):
+-    b = await db.books.find_one({"_id": book_id})
+-    if not b:
+-        raise HTTPException(404, "book not found")
++async def get_book(book_id: str, request: Request):
++    b = await _owned_book(request, book_id)
+     stories = []
+     async for s in db.stories.find({"book_id": book_id}).sort("created_at", 1):
+         stories.append(Story.from_mongo(s).model_dump())
+@@ -97,10 +137,8 @@ async def get_book(book_id: str):
+ 
+ # ---------- stories ----------
+ @router.post("/books/{book_id}/reocr")
+-async def reocr_book(book_id: str):
+-    b = await db.books.find_one({"_id": book_id})
+-    if not b:
+-        raise HTTPException(404, "book not found")
++async def reocr_book(book_id: str, request: Request):
++    b = await _owned_book(request, book_id)
+     if b["status"] in ("ocr_running", "segmenting"):
+         raise HTTPException(409, "OCR already in progress")
+     await db.books.update_one({"_id": book_id}, {"$set": {
+@@ -111,8 +149,8 @@ async def reocr_book(book_id: str):
+ 
+ 
+ @router.get("/stories")
+-async def list_stories(channel_id: Optional[str] = None, status: Optional[str] = None):
+-    q = {}
++async def list_stories(request: Request, channel_id: Optional[str] = None, status: Optional[str] = None):
++    q = dict(await _owner_filter(request))
+     if channel_id and channel_id != "all":
+         q["channel_id"] = channel_id
+     if status and status != "all":
+@@ -124,18 +162,14 @@ async def list_stories(channel_id: Optional[str] = None, status: Optional[str] =
+ 
+ 
+ @router.get("/stories/{story_id}")
+-async def get_story(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def get_story(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     return Story.from_mongo(s).model_dump()
+ 
+ 
+ @router.post("/stories/{story_id}/script")
+-async def gen_script(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def gen_script(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if s["status"] in ("scripting",):
+         raise HTTPException(409, "script already being generated")
+     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "scripting", "error": ""}})
+@@ -144,10 +178,8 @@ async def gen_script(story_id: str):
+ 
+ 
+ @router.post("/stories/{story_id}/produce")
+-async def produce(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def produce(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if not s.get("script", {}).get("chunks"):
+         raise HTTPException(409, "generate the script first")
+     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "rendering", "stage": "Queued", "error": ""}})
+@@ -156,8 +188,9 @@ async def produce(story_id: str):
+ 
+ 
+ @router.post("/stories/{story_id}/stop")
+-async def stop_story(story_id: str):
++async def stop_story(story_id: str, request: Request):
+     """Cancel the running/queued produce (or improve) job for this story."""
++    await _owned_story(request, story_id)
+     j = await db.jobs.find_one(
+         {"ref_id": story_id, "type": {"$in": ["produce", "improve", "segment_fix", "edit_request"]},
+          "status": {"$in": ["queued", "running"]}},
+@@ -175,18 +208,26 @@ async def stop_story(story_id: str):
+ 
+ 
+ @router.post("/jobs/{job_id}/cancel")
+-async def cancel_job_endpoint(job_id: str):
++async def cancel_job_endpoint(job_id: str, request: Request):
+     from job_queue import cancel_job
+     j = await db.jobs.find_one({"_id": job_id})
+     if not j:
+         raise HTTPException(404, "job not found")
++    ref_id = j.get("ref_id") or ""
++    if ref_id and ref_id != "system":
++        # Only the owner (or admin) may cancel a job attached to a story.
++        await _owned_story(request, ref_id)
++    else:
++        user = await _current_user(request)
++        if not user.get("is_admin"):
++            raise HTTPException(404, "job not found")
+     await db.jobs.update_one({"_id": job_id, "status": {"$in": ["queued", "running"]}},
+                              {"$set": {"status": "cancelled", "error": "stopped by user",
+                                        "finished_at": utcnow()}})
+     cancel_job(job_id)
+-    if j.get("ref_id") and j["ref_id"] != "system":
++    if ref_id and ref_id != "system":
+         await db.stories.update_one(
+-            {"_id": j["ref_id"], "status": "rendering"},
++            {"_id": ref_id, "status": "rendering"},
+             {"$set": {"status": "script_ready", "stage": "Stopped by user", "error": ""}})
+     return {"ok": True}
+ 
+@@ -235,10 +276,8 @@ class SegmentRegenerateBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/segments/{index}/regenerate")
+-async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegenerateBody] = None):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def regen_segment(story_id: str, index: int, request: Request, body: Optional[SegmentRegenerateBody] = None):
++    s = await _owned_story(request, story_id)
+     chunks = (s.get("script") or {}).get("chunks") or []
+     if index < 0 or index >= len(chunks):
+         raise HTTPException(400, "invalid segment index")
+@@ -251,10 +290,8 @@ async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegener
+ 
+ 
+ @router.post("/stories/{story_id}/improve")
+-async def improve_story(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def improve_story(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if not s.get("script", {}).get("chunks"):
+         raise HTTPException(409, "generate the script first")
+     if len(s.get("improvements") or []) >= 2:
+@@ -278,7 +315,7 @@ class CreateBody(BaseModel):
+ 
+ 
+ @router.post("/stories/create")
+-async def create_story(body: CreateBody):
++async def create_story(body: CreateBody, request: Request):
+     from script_parser import parse_scene_script
+     from services.video_types import VIDEO_TYPES
+     cfg = VIDEO_TYPES.get(body.video_type)
+@@ -303,7 +340,19 @@ async def create_story(body: CreateBody):
+     parsed = parse_scene_script(body.source_text)
+     supplied_title = body.title.strip() or ((parsed or {}).get("title") or "")
+     bible = ((parsed or {}).get("character_sheet") or "").strip()
++    owner_id = await optional_user_id(request)
++    script_payload = {}
++    if parsed:
++        script_payload = {
++            "chunks": parsed["chunks"],
++            "production_notes": parsed["production_notes"],
++            "imported_verbatim": True,
++            "character_sheet": {"anchor": bible},
++            "missing": parsed["missing"],
++            "is_partial": parsed["is_partial"],
++        }
+     story = Story(book_id=f"prompt-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
++                  owner_id=owner_id,
+                   title_hindi=supplied_title, title_english=supplied_title[:100],
+                   source="Pasted script / prompt", category=cfg["name"],
+                   target_seconds=target, mode=mode,
+@@ -311,18 +360,21 @@ async def create_story(body: CreateBody):
+                   emotional_tone=cfg["tone"][:60], target_audience=cfg["audience"],
+                   visual_style=cfg["style_prefix"][:120], estimated_length=f"{target}s",
+                   status="script_ready" if parsed else "draft",
+-                  stage=f"Loaded {len(parsed['chunks'])} supplied scenes" if parsed else "",
+-                  script={"chunks": parsed["chunks"], "production_notes": parsed["production_notes"],
+-                          "imported_verbatim": True,
+-                          "character_sheet": {"anchor": bible}} if parsed else {},
++                  stage=(f"Loaded {len(parsed['chunks'])} supplied scenes"
++                         + (" · gaps queued for AI fill" if parsed and parsed["is_partial"] else "")
++                         if parsed else ""),
++                  script=script_payload,
+                   character_sheet={"anchor": bible, "text": bible, "locked": bool(bible),
+                                    "visuals_stale": False, "version": 1} if parsed else {})
+     await db.stories.insert_one(story.to_mongo())
+     if parsed:
+         return {"story_id": story.id, "job_id": None, "imported": True,
+-                "imported_segments": len(parsed["chunks"])}
++                "imported_segments": len(parsed["chunks"]),
++                "is_partial": parsed["is_partial"],
++                "missing": parsed["missing"]}
+     job_id = await enqueue("script", story.id, f"Script: {supplied_title[:40] or story.id}")
+-    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0}
++    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0,
++            "is_partial": False, "missing": {"voiceover": [], "visual": [], "video_prompt": []}}
+ 
+ 
+ @router.get("/video-types")
+@@ -336,10 +388,8 @@ class ScriptPatchBody(BaseModel):
+ 
+ 
+ @router.patch("/stories/{story_id}/script")
+-async def patch_script(story_id: str, body: ScriptPatchBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def patch_script(story_id: str, body: ScriptPatchBody, request: Request):
++    s = await _owned_story(request, story_id)
+     if s["status"] == "rendering":
+         raise HTTPException(409, "pipeline busy — wait for the render to finish")
+     chunks = (s.get("script") or {}).get("chunks") or []
+@@ -375,12 +425,10 @@ class ConfigBody(BaseModel):
+ 
+ 
+ @router.put("/stories/{story_id}/config")
+-async def story_config(story_id: str, body: ConfigBody):
++async def story_config(story_id: str, body: ConfigBody, request: Request):
+     import shutil
+ 
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++    s = await _owned_story(request, story_id)
+     if s["status"] == "rendering":
+         raise HTTPException(409, "pipeline busy")
+     patch = {}
+@@ -403,10 +451,8 @@ class CharacterSheetBody(BaseModel):
+ 
+ 
+ @router.patch("/stories/{story_id}/character-sheet")
+-async def update_character_sheet(story_id: str, body: CharacterSheetBody):
+-    story = await db.stories.find_one({"_id": story_id})
+-    if not story:
+-        raise HTTPException(404, "story not found")
++async def update_character_sheet(story_id: str, body: CharacterSheetBody, request: Request):
++    story = await _owned_story(request, story_id)
+     if story.get("status") == "rendering":
+         raise HTTPException(409, "pipeline busy — wait for the render to finish")
+     anchor = body.anchor.strip()
+@@ -436,10 +482,8 @@ class ReviewBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/review")
+-async def review(story_id: str, body: ReviewBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def review(story_id: str, body: ReviewBody, request: Request):
++    s = await _owned_story(request, story_id)
+     mapping = {"approve": "approved", "reject": "rejected", "request_edits": "edits_requested"}
+     if body.action not in mapping:
+         raise HTTPException(400, "action must be approve|reject|request_edits")
+@@ -455,17 +499,34 @@ async def review(story_id: str, body: ReviewBody):
+     if body.action == "request_edits":
+         job_id = await enqueue("edit_request", story_id, "Apply requested story edits",
+                                payload={"notes": body.notes.strip()})
+-    response = await get_story(story_id)
++    response = await get_story(story_id, request)
+     if isinstance(response, dict):
+         response["edit_job_id"] = job_id
+     return response
+ 
+ 
+ # ---------- jobs & dashboard ----------
++async def _visible_story_ids(request: Request) -> Optional[set]:
++    """Return the set of story IDs the caller can see, or ``None`` for admins."""
++    user = await _current_user(request)
++    if user.get("is_admin"):
++        return None
++    uid = user.get("user_id") or ""
++    ids: set[str] = set()
++    async for s in db.stories.find({"owner_id": uid}, {"_id": 1}):
++        ids.add(s["_id"])
++    return ids
++
++
+ @router.get("/jobs")
+-async def list_jobs(limit: int = 30):
++async def list_jobs(request: Request, limit: int = 30):
++    ids = await _visible_story_ids(request)
++    filt: dict = {} if ids is None else {"$or": [
++        {"ref_id": {"$in": list(ids)}},
++        {"ref_id": "system"},
++    ]}
+     out = []
+-    async for j in db.jobs.find().sort("created_at", -1).limit(min(limit, 100)):
++    async for j in db.jobs.find(filt).sort("created_at", -1).limit(min(limit, 100)):
+         d = fix(dict(j))
+         for f in ("created_at", "started_at", "finished_at"):
+             if isinstance(d.get(f), datetime):
+@@ -475,22 +536,31 @@ async def list_jobs(limit: int = 30):
+ 
+ 
+ @router.get("/dashboard")
+-async def dashboard():
++async def dashboard(request: Request):
++    story_filter = await _owner_filter(request)
++    ids = await _visible_story_ids(request)
++    if ids is None:
++        jobs_filter: dict = {}
++    else:
++        jobs_filter = {"$or": [{"ref_id": {"$in": list(ids)}}, {"ref_id": "system"}]}
++
+     status_counts = {}
+-    async for s in db.stories.find({}, {"status": 1}):
++    async for s in db.stories.find(story_filter, {"status": 1}):
+         status_counts[s["status"]] = status_counts.get(s["status"], 0) + 1
+ 
+-    pipeline_t = [{"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
+-                              "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
+-                              "n": {"$sum": 1},
+-                              "produced": {"$sum": {"$cond": [
+-                                  {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
+-                                  1, 0]}}}}]
++    pipeline_t = [
++        {"$match": story_filter} if story_filter else {"$match": {}},
++        {"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
++                    "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
++                    "n": {"$sum": 1},
++                    "produced": {"$sum": {"$cond": [
++                        {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
++                        1, 0]}}}}]
+     agg = await db.stories.aggregate(pipeline_t).to_list(1)
+     cost = agg[0] if agg else {"llm": 0, "tts": 0, "image": 0, "total": 0, "n": 0, "produced": 0}
+     avg = round(cost["total"] / cost["produced"], 3) if cost["produced"] else 0
+     jobs = []
+-    async for j in db.jobs.find().sort("created_at", -1).limit(25):
++    async for j in db.jobs.find(jobs_filter).sort("created_at", -1).limit(25):
+         d = fix(dict(j))
+         for f in ("created_at", "started_at", "finished_at"):
+             if isinstance(d.get(f), datetime):
+@@ -498,18 +568,19 @@ async def dashboard():
+         jobs.append(d)
+ 
+     job_counts = {}
+-    async for j in db.jobs.find({}, {"status": 1}):
++    async for j in db.jobs.find(jobs_filter, {"status": 1}):
+         job_counts[j["status"]] = job_counts.get(j["status"], 0) + 1
+ 
+     beat_coverage = {"hook": 0, "story": 0, "twist": 0, "climax": 0, "action": 0, "lesson": 0}
+-    async for s in db.stories.find({"script.chunks": {"$exists": True, "$ne": []}}, {"script.chunks.beat": 1}):
++    async for s in db.stories.find({**story_filter, "script.chunks": {"$exists": True, "$ne": []}},
++                                   {"script.chunks.beat": 1}):
+         seen = {c.get("beat") for c in s.get("script", {}).get("chunks", []) if isinstance(c, dict)}
+         for b in beat_coverage:
+             if b in seen:
+                 beat_coverage[b] += 1
+ 
+     recent = []
+-    async for s in db.stories.find().sort("updated_at", -1).limit(8):
++    async for s in db.stories.find(story_filter).sort("updated_at", -1).limit(8):
+         recent.append(Story.from_mongo(s).model_dump())
+ 
+     return {
+@@ -518,7 +589,7 @@ async def dashboard():
+                  "image": round(cost["image"], 3), "total": round(cost["total"], 3),
+                  "avg_per_video": avg, "videos_produced": cost["produced"], "n": cost["n"]},
+         "beat_coverage": beat_coverage,
+-        "queue": {"depth": await db.jobs.count_documents({"status": "queued"}),
++        "queue": {"depth": await db.jobs.count_documents({**jobs_filter, "status": "queued"}),
+                   "active": HEARTBEAT["active"],
+                   "workers": HEARTBEAT["workers"],
+                   "paused": QUEUE_PAUSED["paused"],
+@@ -531,7 +602,8 @@ async def dashboard():
+ 
+ # ---------- bulk curation ----------
+ @router.post("/books/{book_id}/script-all")
+-async def script_all(book_id: str):
++async def script_all(book_id: str, request: Request):
++    await _owned_book(request, book_id)
+     n = 0
+     async for s in db.stories.find({"book_id": book_id, "status": "draft"}, {"_id": 1, "title_english": 1}):
+         await enqueue("script", s["_id"], f"Script: {s.get('title_english', '')[:40]}")
+@@ -546,10 +618,11 @@ class BatchBody(BaseModel):
+ 
+ 
+ @router.post("/stories/batch-produce")
+-async def batch_produce(body: BatchBody):
++async def batch_produce(body: BatchBody, request: Request):
++    owner_filter = await _owner_filter(request)
+     queued = []
+     for sid in body.ids[:30]:
+-        s = await db.stories.find_one({"_id": sid})
++        s = await db.stories.find_one({"_id": sid, **owner_filter})
+         if not s or not s.get("script", {}).get("chunks"):
+             continue
+         if s["status"] in ("rendering",):
+@@ -568,10 +641,8 @@ class PublishBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/publish")
+-async def publish_story(story_id: str, body: PublishBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def publish_story(story_id: str, body: PublishBody, request: Request):
++    await _owned_story(request, story_id)
+     if body.platform not in ("youtube", "instagram"):
+         raise HTTPException(400, "platform must be youtube|instagram")
+     job_id = await enqueue("publish", story_id, f"Publish to {platform_label(body.platform)}",
+@@ -742,9 +813,10 @@ async def news_fetch():
+ 
+ 
+ @router.get("/news/items")
+-async def news_items():
++async def news_items(request: Request):
+     out = []
+-    async for s in db.stories.find({"policy": {"$ne": {}}}).sort("created_at", -1).limit(60):
++    q = {"policy": {"$ne": {}}, **(await _owner_filter(request))}
++    async for s in db.stories.find(q).sort("created_at", -1).limit(60):
+         out.append(Story.from_mongo(s).model_dump())
+     return out
+ 
+@@ -833,7 +905,7 @@ class StitchBody(BaseModel):
+ 
+ 
+ @router.post("/stitch")
+-async def stitch_create(body: StitchBody):
++async def stitch_create(body: StitchBody, request: Request):
+     import re
+ 
+     from services.video_types import VIDEO_TYPES
+@@ -881,6 +953,7 @@ async def stitch_create(body: StitchBody):
+         ch = await db.channels.find_one({"key": key})
+ 
+     story = Story(book_id=f"stitch-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
++                  owner_id=await optional_user_id(request),
+                   title_hindi=body.title.strip(),
+                   title_english=body.title.strip()[:100] or "My stitched video",
+                   source="Uploaded images & clips", category=cfg["name"], mode="stitch",
+diff --git a/backend/script_parser.py b/backend/script_parser.py
+index 30480ff..4a9c8ae 100644
+--- a/backend/script_parser.py
++++ b/backend/script_parser.py
+@@ -1,27 +1,95 @@
+ """Deterministic parser for user-supplied scene scripts.
+ 
+-Structured scripts are source material, not prompts: their dialogue and visuals must be
+-preserved instead of rewritten by an LLM.
++Structured scripts are source material, not prompts: their dialogue and visuals
++must be preserved instead of rewritten by an LLM.
++
++A script is considered "structured" when it contains at least one recognisable
++scene block.  Recognised synonyms:
++
++  * Scene header:   सीन N | दृश्य N | scene N (with optional 🎬/🎞️/🎥 prefixes
++                    and an optional time-range or label after the number).
++  * Voiceover:      वॉइसओवर | वॉयसओवर | नैरेशन | voice[- ]over | narration.
++  * Dialogue block: संवाद:  followed by ``Speaker: "text"`` lines.
++  * Image prompt:   विज़ुअल | visuals? | इमेज प्रॉम्प्ट | image prompt | 🖼️.
++  * Video prompt:   वीडियो प्रॉम्प्ट | video prompt | 🎥.
++
++Only the fields that are supplied are captured.  Missing ones are flagged on
++the chunk (``needs_voiceover``, ``needs_visual``, ``needs_video_prompt``) so
++that downstream generation can fill in only the gaps.
+ """
+ import re
+ 
+ 
+ SCENE_RE = re.compile(
+-    r"(?im)^\s*(?:🎬\s*)?(?:सीन|scene)\s*(\d+)\s*(?:[|:.-]\s*)?([^\n]*)$"
++    r"(?im)^\s*(?:[🎬🎞️🎥]\s*)?"
++    r"(?:सीन|दृश्य|scene)\s*(\d+)"
++    r"(?:\s*\([^)]*\))?"       # optional (0:00–0:07) style timestamp
++    r"\s*(?:[|:.\-–—]\s*)?"    # optional separator
++    r"([^\n]*)$"               # rest of the header line is the label
+ )
++
++# Individual speech / narration markers.  ``संवाद:`` is intentionally NOT here —
++# it is a container that holds multiple ``Speaker: "text"`` lines and is parsed
++# separately by :func:`_dialogue_quotes`.
+ SPEECH_RE = re.compile(
+-    r"(?im)(नैरेशन(?:\s*\(\s*वॉयसओवर\s*\))?(?:\s*\+\s*CTA)?|वॉयसओवर|"
+-    r"संवाद\s*[—–-]\s*[^:\n]+|narration(?:\s*\(\s*voiceover\s*\))?|"
+-    r"voiceover|dialogue\s*[—–-]\s*[^:\n]+)\s*:"
++    r"(?im)("
++    r"नैरेशन(?:\s*\(\s*वॉयसओवर\s*\))?(?:\s*\+\s*CTA)?"
++    r"|वॉयसओवर|वॉइसओवर"
++    r"|संवाद\s*[—–\-]\s*[^:\n]+"                 # legacy: संवाद — राजा:
++    r"|narration(?:\s*\(\s*voiceover\s*\))?"
++    r"|voice\s*-?\s*over"
++    r"|dialogue\s*[—–\-]\s*[^:\n]+"
++    r")\s*:"
++)
++
++# Any line that starts with ``संवाद`` (used to skip past the container marker
++# so we can pick up the quotes underneath it).
++DIALOGUE_HEADER_RE = re.compile(r"(?im)^\s*(?:🗣️\s*)?संवाद\s*:\s*$")
++
++VISUAL_RE = re.compile(
++    r"(?im)(?:🖼️\s*)?"
++    r"(?:विज़ुअल|विजुअल|visuals?|scene\s+visual|"
++    r"इमेज\s*प्रॉम्प्ट|image\s*prompt)\s*:"
++)
++
++VIDEO_PROMPT_RE = re.compile(
++    r"(?im)(?:🎥\s*)?(?:वीडियो\s*प्रॉम्प्ट|video\s*prompt)\s*:"
+ )
+-VISUAL_RE = re.compile(r"(?im)(?:विज़ुअल|विजुअल|visuals?|scene\s+visual)\s*:")
+-NOTES_RE = re.compile(r"(?im)^\s*(?:🎵\s*)?(?:प्रोडक्शन\s+नोट्स|production\s+notes)\s*$")
++
++NOTES_RE = re.compile(
++    r"(?im)^\s*(?:🎵\s*|💡\s*)?"
++    r"(?:प्रोडक्शन\s+नोट्स|production\s+notes|काम\s+की\s+टिप्स|tips?)\s*$"
++)
++
+ BIBLE_START_RE = re.compile(
+-    r"(?im)^.*(?:पात्र\s+एवं\s+दृश्य\s+संगति\s+गाइड|consistency\s+bible|character\s+(?:&|and)\s+style\s+guide).*$"
++    r"(?im)^.*(?:पात्र\s+एवं\s+दृश्य\s+संगति\s+गाइड|"
++    r"consistency\s+bible|character\s+(?:&|and)\s+style\s+guide|"
++    r"कैरेक्टर\s*(?:कंसिस्टेंसी|रेफ़रेंस)|character\s*reference|"
++    r"स्टाइल\s*ब्लॉक|style\s*block).*$"
++)
++
++SCRIPT_START_RE = re.compile(
++    r"(?im)^.*(?:सीन-दर-सीन\s+स्क्रिप्ट|scene-by-scene\s+script|"
++    r"दृश्य-दर-दृश्य|scene\s+by\s+scene).*$"
+ )
+-SCRIPT_START_RE = re.compile(r"(?im)^.*(?:सीन-दर-सीन\s+स्क्रिप्ट|scene-by-scene\s+script).*$")
++
++# Handles both straight ("...") and curly (“...”) quotes.
+ QUOTE_RE = re.compile(r"[\"“](.*?)[\"”]", re.DOTALL)
+ 
++# ``Speaker: "quote"`` matches (used inside a संवाद: block).
++SPEAKER_LINE_RE = re.compile(
++    r"(?m)^\s*[^\n:]{1,60}\s*:\s*[\"“](.+?)[\"”]\s*$",
++    re.DOTALL,
++)
++
++TITLE_LABEL_RE = re.compile(r"(?im)^\s*(?:शीर्षक|title)\s*:\s*(.+?)\s*$")
++
++# Lines that look like format/metadata (skipped when guessing the title).
++METADATA_PREFIXES = (
++    "(", "फ़ॉर्मेट", "फॉर्मेट", "format", "फ़ॉर्मैट",
++    "duration", "अवधि", "language", "भाषा",
++)
++
+ 
+ def _clean(value: str) -> str:
+     return re.sub(r"[ \t]+", " ", value).strip(" \t\r\n")
+@@ -44,9 +112,10 @@ def _beat(index: int, total: int, label: str) -> str:
+     value = label.lower()
+     if index == 0 or "hook" in value or "हुक" in value:
+         return "hook"
+-    if index == total - 1 or "closing" in value or "क्लोज" in value or "lesson" in value or "सीख" in value:
++    if (index == total - 1 or "closing" in value or "क्लोज" in value
++            or "समापन" in value or "lesson" in value or "सीख" in value):
+         return "lesson"
+-    if "climax" in value or "प्रकटन" in value or "चरम" in value:
++    if "climax" in value or "प्रकटन" in value or "चरम" in value or "प्राकट्य" in value:
+         return "climax"
+     if "twist" in value or "मोड़" in value or "तपस्या" in value:
+         return "twist"
+@@ -67,30 +136,65 @@ def _emotion(label: str) -> str:
+     return _clean(parenthetical[-1] if parenthetical else label) or "storytelling"
+ 
+ 
+-def _spoken_text(body: str, first_speech: re.Match | None) -> str:
+-    if not first_speech:
+-        return ""
+-    speech = body[first_speech.start():]
+-    parts = []
+-    matches = list(SPEECH_RE.finditer(speech))
++def _dialogue_quotes(block: str) -> list[str]:
++    """Extract ``Speaker: "quote"`` lines from a संवाद: container."""
++    quotes = []
++    for match in SPEAKER_LINE_RE.finditer(block):
++        text = _clean(match.group(1))
++        if text:
++            quotes.append(text)
++    return quotes
++
++
++def _spoken_text(body: str) -> str:
++    """Collect voiceover / narration / dialogue text from a scene body."""
++    parts: list[str] = []
++
++    # 1) Standalone speech markers (नैरेशन:, वॉइसओवर:, संवाद — राजा:, etc.)
++    matches = list(SPEECH_RE.finditer(body))
+     for i, marker in enumerate(matches):
+-        end = matches[i + 1].start() if i + 1 < len(matches) else len(speech)
+-        content = speech[marker.end():end]
++        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
++        # stop at the next section header (visual/video/notes) if it appears first
++        for stopper in (VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, DIALOGUE_HEADER_RE):
++            m = stopper.search(body, marker.end(), end)
++            if m and m.start() < end:
++                end = m.start()
++        content = body[marker.end():end]
+         quotes = [_clean(q) for q in QUOTE_RE.findall(content) if _clean(q)]
+         if quotes:
+             parts.extend(quotes)
+         else:
+-            plain = NOTES_RE.split(content, maxsplit=1)[0]
+-            if _clean(plain):
+-                parts.append(_clean(plain))
++            plain = _clean(content)
++            if plain:
++                parts.append(plain)
++
++    # 2) ``संवाद:`` container — extract every "Speaker: quote" line inside it.
++    dialog = DIALOGUE_HEADER_RE.search(body)
++    if dialog:
++        end = len(body)
++        for stopper in (VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, SPEECH_RE):
++            m = stopper.search(body, dialog.end())
++            if m and m.start() < end:
++                end = m.start()
++        for q in _dialogue_quotes(body[dialog.end():end]):
++            if q not in parts:
++                parts.append(q)
++
+     return "\n".join(parts)
+ 
+ 
+-def _visual_text(body: str, first_speech: re.Match | None) -> str:
+-    match = VISUAL_RE.search(body)
++def _prompt_text(body: str, marker: "re.Pattern[str]") -> str:
++    """Return the text under a ``visual:`` / ``video prompt:`` heading."""
++    match = marker.search(body)
+     if not match:
+         return ""
+-    end = first_speech.start() if first_speech else len(body)
++    end = len(body)
++    for stopper in (SPEECH_RE, VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, DIALOGUE_HEADER_RE):
++        if stopper is marker:
++            continue
++        m = stopper.search(body, match.end())
++        if m and m.start() < end:
++            end = m.start()
+     return _clean(body[match.end():end])
+ 
+ 
+@@ -106,9 +210,19 @@ def _consistency_bible(text: str, first_scene_start: int) -> str:
+ 
+ 
+ def _title(text: str) -> str:
++    label = TITLE_LABEL_RE.search(text)
++    if label:
++        return _clean(label.group(1)).strip('"')[:150]
+     for line in text.splitlines():
+         clean = _clean(line).strip('"')
+-        if clean and not clean.startswith(("(", "फॉर्मेट", "Format")):
++        if not clean:
++            continue
++        lower = clean.lower()
++        if any(lower.startswith(prefix.lower()) for prefix in METADATA_PREFIXES):
++            continue
++        # Strip a leading emoji-plus-space if present so "🌟 Title" -> "Title".
++        clean = re.sub(r"^[^\w\u0900-\u097F(]+", "", clean).strip()
++        if clean:
+             return clean[:150]
+     return "Imported scene script"
+ 
+@@ -121,24 +235,37 @@ def parse_scene_script(text: str) -> dict | None:
+     chunks = []
+     for idx, match in enumerate(matches):
+         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+-        body = NOTES_RE.split(text[match.end():end], maxsplit=1)[0]
+-        first_speech = SPEECH_RE.search(body)
+-        visual = _visual_text(body, first_speech)
+-        voiceover = _spoken_text(body, first_speech)
+-        if not visual and not voiceover:
++        # Trim off any "production notes" / "tips" section that follows the last scene.
++        raw_body = text[match.end():end]
++        notes_stop = NOTES_RE.search(raw_body)
++        body = raw_body[:notes_stop.start()] if notes_stop else raw_body
++
++        voiceover = _spoken_text(body)
++        visual = _prompt_text(body, VISUAL_RE)
++        video_prompt = _prompt_text(body, VIDEO_PROMPT_RE) or visual
++
++        # Only keep a scene if the user supplied SOMETHING for it; otherwise the
++        # scene is empty scaffolding and we skip it entirely.
++        if not (voiceover or visual or video_prompt):
+             continue
++
+         label = _clean(match.group(2))
+-        chunks.append({
++        chunk = {
+             "chunk_id": f"scene-{match.group(1)}",
+             "source_scene": int(match.group(1)),
+             "source_label": label,
+             "beat": "story",  # assigned after skipped/usable scenes are known
+             "voiceover": voiceover[:4000],
+             "visual": visual[:4000],
+-            "video_prompt": visual[:4000],
+-            "camera": _camera(visual),
++            "video_prompt": video_prompt[:4000],
++            "camera": _camera(visual or video_prompt),
+             "emotion": _emotion(label),
+-        })
++            "needs_voiceover": not bool(voiceover),
++            "needs_visual": not bool(visual),
++            "needs_video_prompt": not bool(video_prompt),
++        }
++        chunks.append(chunk)
++
+     if not chunks:
+         return None
+     for idx, chunk in enumerate(chunks):
+@@ -146,9 +273,18 @@ def parse_scene_script(text: str) -> dict | None:
+ 
+     notes_match = NOTES_RE.search(text)
+     notes = _clean(text[notes_match.end():]) if notes_match else ""
++
++    missing = {
++        "voiceover": [c["chunk_id"] for c in chunks if c["needs_voiceover"]],
++        "visual": [c["chunk_id"] for c in chunks if c["needs_visual"]],
++        "video_prompt": [c["chunk_id"] for c in chunks if c["needs_video_prompt"]],
++    }
++
+     return {
+         "title": _title(text),
+         "character_sheet": _consistency_bible(text, matches[0].start()),
+         "chunks": chunks,
+         "production_notes": notes[:8000],
+-    }
+\ No newline at end of file
++        "missing": missing,
++        "is_partial": any(missing.values()),
++    }

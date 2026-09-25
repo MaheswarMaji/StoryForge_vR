@@ -3,7 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 from urllib.parse import urlparse
 
-ImageEngine = Literal['auto', 'gemini', 'emergent', 'openai', 'stability', 'fal_flux', 'replicate_flux', 'hf_flux', 'studio']
+ImageEngine = Literal['auto', 'gemini', 'openai', 'stability', 'fal_flux', 'replicate_flux', 'hf_flux', 'studio']
 VideoEngine = Literal['auto', 'kenburns', 'gemini_veo', 'studio']
 
 

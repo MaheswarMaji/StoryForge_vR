@@ -43,7 +43,7 @@ def mock_http(monkeypatch, handler):
 
 
 @pytest.mark.asyncio
-async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_path):
+async def test_selected_gemini_never_falls_back_to_other_providers(sandbox, monkeypatch, tmp_path):
     await sandbox.settings.insert_one({'key': 'media_engines', 'values': {'image': 'gemini', 'video': 'kenburns'}})
     called = []
     async def direct(prompt, ref=None):
@@ -53,7 +53,7 @@ async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_
         raise AssertionError('Wrong provider called')
     monkeypatch.setattr(gemini, 'gen_image', direct)
     from services import imagegen
-    monkeypatch.setattr(imagegen, '_gen_gemini_proxy', forbidden)
+    monkeypatch.setattr(imagegen, '_gen_openai_image', forbidden)
     with pytest.raises(generation.ProviderFailure, match='RESOURCE_EXHAUSTED'):
         await router.image('prompt', tmp_path / 'out.png')
     assert called == ['gemini']
@@ -65,8 +65,8 @@ async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_segment_inheritance(sandbox):
     await sandbox.settings.insert_one({'key': 'media_engines', 'values': {'image': 'gemini', 'video': 'kenburns'}})
-    await sandbox.story_engines.update_one({'_id': 'test-story'}, {'$set': {'image': 'emergent', 'segments': {'0': {'image': 'studio', 'video': 'gemini_veo'}}}})
-    assert await generation.resolve('image') == 'emergent'
+    await sandbox.story_engines.update_one({'_id': 'test-story'}, {'$set': {'image': 'openai', 'segments': {'0': {'image': 'studio', 'video': 'gemini_veo'}}}})
+    assert await generation.resolve('image') == 'openai'
     assert await generation.resolve('image', 0) == 'studio'
     assert await generation.resolve('video', 0) == 'gemini_veo'
     assert await generation.resolve('video', 1) == 'kenburns'

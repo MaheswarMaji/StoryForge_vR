@@ -229,7 +229,7 @@ class TestStoryConfig:
 
 # ---------- 5. API Keys Vault ----------
 class TestApiKeysVault:
-    ALL_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "EMERGENT_LLM_KEY", "FAL_KEY", "HF_TOKEN",
+    ALL_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "FAL_KEY", "HF_TOKEN",
                 "REPLICATE_API_TOKEN", "YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET",
                 "YOUTUBE_REFRESH_TOKEN", "INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_USER_ID"}
 

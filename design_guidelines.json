@@ -130,7 +130,7 @@
         "components": [
           "Interactive 6-Beat Story Script Editor (Hook, Story, Twist, Climax, Action, Lesson) with color-coded segment cards",
           "Per-Segment Character Consistency Sheet Drawer (Character prompt anchors, seed IDs, reference tags)",
-          "Per-Segment TTS Audio Player Preview with Hindi/Regional voice selection (OpenAI Emergent Universal Key TTS)",
+          "Per-Segment TTS Audio Player Preview with Hindi/Regional voice selection (local Kokoro / OpenAI / Gemini TTS)",
           "Per-Segment Visual Prompt & AI Frame Preview with FFmpeg motion settings (Zoom In, Pan Left, Slow Push)",
           "Integrated 9:16 Video Player with synced narration, background music track, and burned-in subtitle overlay",
           "Automated LLM QA Report Matrix (Checks: 6 Beat Integrity, Visual Consistency, Narration Pacing, Content Safety, Cultural Accuracy)",

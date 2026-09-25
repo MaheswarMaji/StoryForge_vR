@@ -5,7 +5,7 @@ from db import db
 from engine_models import (EngineSettings, EngineSettingsView, StoryEngines, StoryEnginesView,
     GenerationEvent, DiagnosticRequest, ConnectionResult, StudioJobView,
     StudioAssetView, StudioCharacterRequest, StudioCharacterView)
-from services import generation
+from services import generation, studio_local
 
 router = APIRouter()
 
@@ -15,22 +15,28 @@ async def view_settings():
     options = [
         ('auto', 'Automatic · reference-safe fallback', '', True, 'Only Auto may switch providers.'),
         ('gemini', 'Google Gemini · your key', 'GEMINI_API_KEY', True, 'Image generation requires project billing/quota.'),
-        ('emergent', 'Gemini via Emergent', 'EMERGENT_LLM_KEY', True, 'Uses Emergent key credits.'),
         ('openai', 'OpenAI GPT Image', 'OPENAI_API_KEY', False, 'This adapter cannot edit reference images; blocked for continuity-locked frames.'),
         ('stability', 'Stability AI', 'STABILITY_API_KEY', False, 'Text-to-image only; blocked for continuity-locked frames.'),
         ('fal_flux', 'fal.ai FLUX', 'FAL_KEY', False, 'Text-to-image only; blocked for continuity-locked frames.'),
         ('replicate_flux', 'Replicate FLUX', 'REPLICATE_API_TOKEN', False, 'Text-to-image only; blocked for continuity-locked frames.'),
         ('hf_flux', 'Hugging Face FLUX', 'HF_TOKEN', False, 'Hosted model availability varies; no reference support.'),
-        ('studio', 'Your Studio · server27', 'STUDIO_API_TOKEN', True, 'API must be installed and pass QC before use.'),
+        ('studio', 'Your Studio · server27', '', True, 'Local worker on server27: still images only (576×1024). StoryForge review decides acceptance.'),
     ]
     def option(row):
         key, label, env, reference, note = row
-        configured = (not env or bool(os.getenv(env, '').strip())) and (key != 'studio' or bool(s.studio_base_url))
+        configured = (not env or bool(os.getenv(env, '').strip()))
+        if key == 'studio':
+            configured = bool(s.studio_base_url) or studio_local.is_configured()
         return dict(id=key, label=label, configured=configured, reference_aware=reference, note=note)
+    studio_video = ('studio', 'Your Studio · server27', '', True, 'The worker does not expose video; not available.')
     videos = [options[0], ('kenburns', 'Local motion · Ken Burns (not generative AI)', '', True, 'Animates the approved image locally; no API cost.'),
-              ('gemini_veo', 'Google Veo · image-to-video', 'GEMINI_API_KEY', True, 'Uses the approved frame; paid video quota required.'), options[-1]]
+              ('gemini_veo', 'Google Veo · image-to-video', 'GEMINI_API_KEY', True, 'Uses the approved frame; paid video quota required.'), studio_video]
+    video_options = [option(o) for o in videos]
+    for o in video_options:
+        if o['id'] == 'studio':
+            o['configured'] = bool(s.studio_base_url and os.getenv('STUDIO_API_TOKEN', '').strip())
     return EngineSettingsView(**s.model_dump(), studio_token_set=bool(os.getenv('STUDIO_API_TOKEN', '').strip()),
-                              image_options=[option(o) for o in options], video_options=[option(o) for o in videos])
+                              image_options=[option(o) for o in options], video_options=video_options)
 
 
 @router.get('/settings/media-engines', response_model=EngineSettingsView)
@@ -101,7 +107,16 @@ async def test_gemini(body: DiagnosticRequest):
 async def studio_test():
     from services.studio import StudioClient
     try:
-        async with StudioClient(await generation.settings()) as studio:
+        config = await generation.settings()
+        if not config.studio_base_url:
+            ok, message = studio_local.check()
+            if not ok:
+                raise generation.ProviderFailure(message, code='NOT_CONFIGURED', action='Check STUDIO_ROOT / STUDIO_PYTHON / STUDIO_BATCH_SCRIPT in backend/.env.')
+            help_text = await studio_local.self_test()
+            root, python, script = studio_local.paths()
+            return ConnectionResult(status='connected', message='Local Studio worker starts correctly. Images: PNG 576×1024, one job at a time.',
+                                    capabilities={'transport': 'local subprocess', 'worker': str(script), 'python': str(python), 'help': help_text[:600]})
+        async with StudioClient(config) as studio:
             capabilities = await studio.json('GET', 'capabilities')
         return ConnectionResult(status='connected', message='Studio API reachable. Generation and QC still depend on installed workers.', capabilities=capabilities)
     except Exception as error:

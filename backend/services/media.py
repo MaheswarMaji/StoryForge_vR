@@ -29,17 +29,6 @@ _FONT_CANDIDATES = {
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"],
 }
 
-_tts = None
-
-
-def _get_tts():
-    global _tts
-    if _tts is None:
-        from emergentintegrations.llm.openai import OpenAITextToSpeech
-        _tts = OpenAITextToSpeech(api_key=candidate_keys()[0])
-    return _tts
-
-
 def _img_tts_keys():
     return candidate_keys()
 
@@ -86,7 +75,7 @@ async def synthesize_voice(text: str, voice: str, speed: float, out_path: Path,
 
 
 async def openai_tts(text: str, voice_spec: str, out_path: Path) -> float:
-    from emergentintegrations.llm.openai import OpenAITextToSpeech
+    from openai import AsyncOpenAI
     clean = " ".join(str(text).split())[:3500]
     last_err = None
     for key in _img_tts_keys():
@@ -96,11 +85,11 @@ async def openai_tts(text: str, voice_spec: str, out_path: Path) -> float:
                 vo = GEMINI_TO_OPENAI_VOICE.get(vo.split(":", 1)[1].lower(), "onyx")
             if vo not in OPENAI_VOICES:
                 vo = "onyx"
-            tts = OpenAITextToSpeech(api_key=key)
-            audio = await tts.generate_speech(
-                text=clean, model="tts-1", voice=vo,
+            client = AsyncOpenAI(api_key=key, timeout=120)
+            audio = await client.audio.speech.create(
+                model="tts-1", voice=vo, input=clean,
                 speed=max(0.25, min(4.0, 1.0)), response_format="mp3")
-            out_path.write_bytes(audio)
+            out_path.write_bytes(audio.content)
             return ffprobe_duration(out_path)
         except Exception as e:
             last_err = e

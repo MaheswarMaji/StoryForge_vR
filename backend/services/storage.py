@@ -1,36 +1,36 @@
+"""Local-disk object storage (replaces the old hosted object store).
+
+Files live under STORAGE_DIR (default: <repo>/storage). Object paths look like
+"storyforge/uploads/<book_id>/<filename>" and are what gets saved in MongoDB as
+`storage_path`, so the interface (put_object / get_object) is unchanged.
+"""
+import mimetypes
 import os
+from pathlib import Path
 
-import requests
-
-STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
-STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
 APP_NAME = "storyforge"
-storage_key = None
+STORAGE_ROOT = Path(os.environ.get("STORAGE_DIR") or Path(__file__).resolve().parent.parent.parent / "storage")
 
 
-def init_storage(force: bool = False):
-    global storage_key
-    if storage_key and not force:
-        return storage_key
-    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": os.environ.get("EMERGENT_LLM_KEY")}, timeout=30)
-    resp.raise_for_status()
-    storage_key = resp.json()["storage_key"]
-    return storage_key
+def _resolve(path: str) -> Path:
+    """Map an object path to a file under STORAGE_ROOT, refusing anything that escapes it."""
+    root = STORAGE_ROOT.resolve()
+    target = (root / str(path).lstrip("/")).resolve()
+    if root != target and root not in target.parents:
+        raise ValueError("invalid storage path")
+    return target
 
 
-def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    resp = requests.put(
-        f"{STORAGE_URL}/objects/{path}",
-        headers={"X-Storage-Key": key, "Content-Type": content_type},
-        data=data, timeout=120,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def put_object(path: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
+    target = _resolve(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    return {"path": str(path).lstrip("/"), "size": len(data), "content_type": content_type}
 
 
 def get_object(path: str):
-    key = init_storage()
-    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=120)
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
+    target = _resolve(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"object not found: {path}")
+    content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return target.read_bytes(), content_type

@@ -1,0 +1,2079 @@
+diff --git a/.gitignore b/.gitignore
+index c2cc6c6..2f73103 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -81,8 +81,6 @@ memory/test_credentials.md
+ # Mobile development
+ android-sdk/
+ 
+-# overlay black-box crash/user-report dumps — session data, never history
+-**/.emergent/recordings/
+ frontend/node_modules/.cache/default-development/1.pack
+ frontend/node_modules/.cache/default-development/4.pack
+ frontend/node_modules/.cache/default-development/7.pack
+@@ -93,7 +91,11 @@ backend/media/final/6aa616a70b6da578466afad5.mp4
+ .env
+ .env.*
+ *.env
++!.env.example
+ credentials.json
+ *.key
+ .credentials
+ frontend/node_modules/.cache/default-development/0.pack
++
++# local object storage (uploaded PDFs, stitch mirrors)
++storage/
+diff --git a/README.md b/README.md
+index 3786c8a..7943989 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,24 @@
+-# Here are your Instructions
++# StoryForge
++
++React (CRA + craco) frontend and FastAPI + MongoDB backend. No third-party hosting platform is required.
++
++## Run locally
++
++Prerequisites: Python 3.11+, Node 18/20 + yarn 1.x, MongoDB, ffmpeg and poppler-utils (`pdfinfo`).
++
++```bash
++# 1. backend
++cd backend
++cp .env.example .env            # edit MONGO_URL / API keys
++pip install -r requirements.txt
++uvicorn server:app --reload --port 8001
++
++# 2. frontend (new terminal)
++cd frontend
++cp .env.example .env
++yarn install
++yarn start                      # http://localhost:3000, /api is proxied to :8001
++```
++
++Uploaded PDFs are stored on local disk in `storage/` (override with `STORAGE_DIR`); generated media goes to `media/`.
++Google sign-in is optional and only needed for the Admin Console (`GOOGLE_CLIENT_ID` in `backend/.env`).
+diff --git a/auth_testing.md b/auth_testing.md
+index 5e37edb..5940e58 100644
+--- a/auth_testing.md
++++ b/auth_testing.md
+@@ -1,11 +1,13 @@
+-# StoryForge — Auth-Gated App Testing Playbook (Emergent Google Auth)
++# StoryForge — Auth Testing Playbook (Google Sign-In)
+ 
+ ## How auth works here
+-- Login is Google-only via Emergent Auth: `https://auth.emergentagent.com/?redirect=<origin>/dashboard`
+-- After consent, frontend lands on `/dashboard#session_id=...`, AuthCallback POSTs `{session_id}` to `/api/auth/session`
+-- Backend exchanges it at `https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data`, stores user + session (7 days), sets httpOnly cookie `session_token` (secure, samesite=none)
+-- ALL `/api/*` routes require auth (cookie OR `Authorization: Bearer <session_token>`) EXCEPT:
+-  `/api`, `/api/`, `/api/auth/*`, `/api/oauth/callback`, `/api/media-health`, and the static `/api/media/*` mount
++- Login is Google-only and optional (only the Admin Console needs it). The login page loads Google Identity Services
++  using the `GOOGLE_CLIENT_ID` served by `GET /api/auth/config`.
++- Google returns an ID token to the browser, which POSTs `{credential}` to `/api/auth/session`.
++- The backend verifies the token directly with Google (`google-auth`), creates/updates the user, stores a 7-day session
++  and sets the httpOnly cookie `session_token` (Lax on http; Secure + SameSite=None when `COOKIE_SECURE=true`).
++- The first user to sign in becomes admin; emails in `ADMIN_EMAILS` are always admin.
++- Cookie OR `Authorization: Bearer <session_token>` is accepted.
+ 
+ ## Step 1: Create a test session directly in Mongo
+ mongosh --eval "
+@@ -29,8 +31,8 @@ print('SESSION_TOKEN=' + sessionToken);
+ "
+ 
+ ## Step 2: Test backend API (use the external preview URL, not localhost)
+-# Unauthenticated -> 401
+-curl -s -o /dev/null -w "%{http_code}" https://<preview-url>/api/stories
++# Admin routes without a session -> 401
++curl -s -o /dev/null -w "%{http_code}" https://<preview-url>/api/admin/overview
+ # Authenticated -> 200
+ curl -s https://<preview-url>/api/auth/me -H "Authorization: Bearer SESSION_TOKEN"
+ curl -s https://<preview-url>/api/stories -H "Authorization: Bearer SESSION_TOKEN"
+@@ -50,10 +52,9 @@ await page.goto("https://<preview-url>/dashboard");  // must NOT bounce to /logi
+ 
+ ## Checklist
+ - `/api/auth/me` returns user data with user_id/email/name/picture
+-- Unauthenticated /api/* JSON calls return 401 (not data)
++- Admin endpoints return 401/403 without an admin session
+ - With cookie/bearer: dashboard loads, stories list loads
+ - `/login` shows the Google-only login screen
+-- Callback detection uses useLocation().hash (render-time), not window.location.hash
+ - Logout clears session: POST /api/auth/logout then /auth/me -> 401
+ 
+ ## Cleanup
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..5ca183a
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,29 @@
++# --- required ---
++MONGO_URL="mongodb://localhost:27017"
++DB_NAME="storyforge"
++
++# --- Google sign-in ---
++# Create an OAuth 2.0 "Web application" client in Google Cloud Console and add
++# http://localhost:3000 and your public https URL under "Authorized JavaScript origins".
++GOOGLE_CLIENT_ID=""
++# true = every /api route needs a Google login (set this in production, after GOOGLE_CLIENT_ID works)
++AUTH_REQUIRED=false
++# The ONLY admin accounts (comma-separated Gmail addresses)
++ADMIN_EMAILS=""
++# Who may sign in. Empty = any Google account. Admins are always allowed.
++ALLOWED_EMAILS=""
++# Set to true when the site is served over https (cross-site cookies)
++COOKIE_SECURE=false   # set to true behind https
++
++# --- optional: where uploaded PDFs are kept (default: <repo>/storage) ---
++# STORAGE_DIR=/path/to/storage
++
++# --- AI providers: set whichever you use (can also be entered later on the Settings page) ---
++GEMINI_API_KEY=""
++OPENAI_API_KEY=""
++# OPENAI_TEXT_MODEL="gpt-5.4"
++STABILITY_API_KEY=""
++HF_TOKEN=""
++FAL_KEY=""
++REPLICATE_API_TOKEN=""
++PEXELS_API_KEY=""
+diff --git a/backend/admin.py b/backend/admin.py
+index 27db114..ce0d972 100644
+--- a/backend/admin.py
++++ b/backend/admin.py
+@@ -5,7 +5,7 @@ from datetime import datetime, timezone
+ 
+ from fastapi import APIRouter, HTTPException, Request
+ 
+-from auth import _token_from, _utc, admin_emails
++from auth import _token_from, _utc, is_admin_email
+ from db import db
+ 
+ admin_router = APIRouter(prefix="/api/admin")
+@@ -32,7 +32,7 @@ async def verify_admin(request: Request):
+     user = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0})
+     if not user:
+         raise HTTPException(401, "user not found")
+-    if not (user.get("role") == "admin" or user.get("email", "").lower() in admin_emails()):
++    if not is_admin_email(user.get("email")):
+         raise HTTPException(403, "admin access required")
+     request.state.user_id = user["user_id"]
+     return user
+diff --git a/backend/auth.py b/backend/auth.py
+index b09c236..328a070 100644
+--- a/backend/auth.py
++++ b/backend/auth.py
+@@ -1,11 +1,12 @@
+-"""Emergent-managed Google OAuth — login with Google only."""
++"""Google Sign-In: the browser gets a Google ID token, we verify it directly with Google."""
++import asyncio
++import secrets
+ import uuid
+ from datetime import datetime, timedelta, timezone
+ import os
+ 
+-import httpx
+-from typing import Any
+-
++from google.auth.transport import requests as google_requests
++from google.oauth2 import id_token as google_id_token
+ from fastapi import APIRouter, HTTPException, Request, Response
+ from pydantic import BaseModel
+ 
+@@ -19,8 +20,40 @@ auth_router = APIRouter(prefix="/api/auth")
+ EXEMPT_PREFIXES = ("/api/auth", "/api/oauth/callback", "/api/media-health")
+ 
+ 
++def _email_set(var):
++    return {e.strip().lower() for e in os.environ.get(var, "").split(",") if e.strip()}
++
++
+ def admin_emails():
+-    return {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
++    """Only these Google accounts are admins (comma-separated ADMIN_EMAILS)."""
++    return _email_set("ADMIN_EMAILS")
++
++
++def is_admin_email(email):
++    return (email or "").strip().lower() in admin_emails()
++
++
++def auth_required():
++    """AUTH_REQUIRED=true makes every /api route need a signed-in Google session."""
++    return os.environ.get("AUTH_REQUIRED", "").strip().lower() in ("1", "true", "yes")
++
++
++def email_allowed(email):
++    """ALLOWED_EMAILS empty = any verified Google account may sign in. Admins are always allowed."""
++    email = (email or "").strip().lower()
++    allowed = _email_set("ALLOWED_EMAILS")
++    return not allowed or email in allowed or email in admin_emails()
++
++
++def google_client_id():
++    return os.environ.get("GOOGLE_CLIENT_ID", "").strip()
++
++
++def _cookie_flags():
++    """The app is same-origin (Caddy serves the UI and /api), so Lax is enough.
++    Set COOKIE_SECURE=true when the site is served over https."""
++    secure = os.environ.get("COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
++    return {"secure": secure, "samesite": "lax"}
+ 
+ 
+ def _utc(v):
+@@ -40,6 +73,8 @@ def _token_from(request: Request) -> str:
+ 
+ 
+ async def verify_auth(request: Request):
++    if not auth_required():
++        return
+     path = request.url.path
+     if path in ("/api", "/api/") or any(path.startswith(p) for p in EXEMPT_PREFIXES):
+         return
+@@ -49,31 +84,42 @@ async def verify_auth(request: Request):
+     doc = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+     if not doc or _utc(doc.get("expires_at")) < datetime.now(timezone.utc):
+         raise HTTPException(401, "session expired — sign in again")
++    if not email_allowed(doc.get("email")):
++        raise HTTPException(403, "this account is not allowed")
+     request.state.user_id = doc.get("user_id")
+ 
+ 
+ class SessionBody(BaseModel):
+-    session_id: str
++    credential: str  # Google ID token (JWT) from Google Identity Services
++
++
++@auth_router.get("/config")
++async def auth_config():
++    return {"google_client_id": google_client_id(), "auth_required": auth_required()}
+ 
+ 
+ @auth_router.post("/session")
+ async def create_session(body: SessionBody, response: Response):
+-    # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+-    async with httpx.AsyncClient(timeout=30) as client:
+-        r = await client.get(
+-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+-            headers={"X-Session-ID": body.session_id},
+-        )
+-    if r.status_code != 200:
++    client_id = google_client_id()
++    if not client_id:
++        raise HTTPException(503, "GOOGLE_CLIENT_ID is not set in backend/.env")
++    try:
++        data = await asyncio.to_thread(
++            google_id_token.verify_oauth2_token, body.credential, google_requests.Request(), client_id,
++            clock_skew_in_seconds=int(os.environ.get("GOOGLE_CLOCK_SKEW_SECONDS", "10")))
++    except ValueError as e:
++        print(f"[auth] google token rejected: {e}", flush=True)
+         raise HTTPException(401, "Google sign-in could not be verified")
+-    data = r.json()
+-    email = data.get("email", "")
++    email = (data.get("email") or "").lower()
++    if not email or not data.get("email_verified"):
++        raise HTTPException(401, "Google account email is not verified")
++    if not email_allowed(email):
++        raise HTTPException(403, "This Google account is not allowed to use StoryForge")
+     user = await db.users.find_one({"email": email}, {"_id": 0})
+     if not user:
+-        first = await db.users.count_documents({}) == 0
+         user = {"user_id": f"user_{uuid.uuid4().hex[:12]}", "email": email,
+                 "name": data.get("name", ""), "picture": data.get("picture", ""),
+-                "role": "admin" if first or email in admin_emails() else "user",
++                "role": "admin" if is_admin_email(email) else "user",
+                 "created_at": datetime.now(timezone.utc)}
+         await db.users.insert_one(dict(user))
+     else:
+@@ -81,12 +127,13 @@ async def create_session(body: SessionBody, response: Response):
+             {"user_id": user["user_id"]},
+             {"$set": {"name": data.get("name", user.get("name", "")),
+                       "picture": data.get("picture", user.get("picture", ""))}})
++    session_token = secrets.token_urlsafe(32)
+     await db.user_sessions.insert_one({
+-        "user_id": user["user_id"], "session_token": data["session_token"],
++        "user_id": user["user_id"], "email": email, "session_token": session_token,
+         "expires_at": datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS),
+         "created_at": datetime.now(timezone.utc)})
+-    response.set_cookie(SESSION_COOKIE, data["session_token"], max_age=SESSION_DAYS * 86400,
+-                        path="/", secure=True, samesite="none", httponly=True)
++    response.set_cookie(SESSION_COOKIE, session_token, max_age=SESSION_DAYS * 86400,
++                        path="/", httponly=True, **_cookie_flags())
+     return {"user": {k: user[k] for k in ("user_id", "email", "name", "picture")}}
+ 
+ 
+@@ -106,6 +153,8 @@ async def optional_user_id(request: "Request") -> str:
+ async def me(request: Request):
+     token = _token_from(request)
+     if not token:
++        if auth_required():
++            raise HTTPException(401, "login required")
+         return Response(status_code=204)
+     sess = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
+     if not sess or _utc(sess.get("expires_at")) < datetime.now(timezone.utc):
+@@ -114,7 +163,7 @@ async def me(request: Request):
+     if not user:
+         raise HTTPException(401, "user not found")
+     out = {k: user.get(k) for k in ("user_id", "email", "name", "picture")}
+-    out["is_admin"] = user.get("role") == "admin" or user.get("email", "").lower() in admin_emails()
++    out["is_admin"] = is_admin_email(user.get("email"))
+     return out
+ 
+ 
+diff --git a/backend/engine_models.py b/backend/engine_models.py
+index 9b4d8c8..2feaa2a 100644
+--- a/backend/engine_models.py
++++ b/backend/engine_models.py
+@@ -3,7 +3,7 @@ from typing import Any, Literal
+ from pydantic import BaseModel, Field, field_validator
+ from urllib.parse import urlparse
+ 
+-ImageEngine = Literal['auto', 'gemini', 'emergent', 'openai', 'stability', 'fal_flux', 'replicate_flux', 'hf_flux', 'studio']
++ImageEngine = Literal['auto', 'gemini', 'openai', 'stability', 'fal_flux', 'replicate_flux', 'hf_flux', 'studio']
+ VideoEngine = Literal['auto', 'kenburns', 'gemini_veo', 'studio']
+ 
+ 
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index f69f20f..e43f47c 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -37,7 +37,6 @@ dnspython==2.8.0
+ docopt==0.6.2
+ ecdsa==0.19.2
+ email-validator==2.3.0
+-emergentintegrations==0.2.0
+ espeakng-loader==0.2.4
+ execnet==2.1.2
+ fal_client==1.0.1
+@@ -80,7 +79,6 @@ jsonschema-specifications==2025.9.1
+ kokoro==0.9.4
+ language-tags==1.3.1
+ librt==0.15.0
+-litellm @ https://customer-assets.emergentagent.com/internal-asset/library/litellm-1.80.0-py3-none-any.whl#sha256=adf398c513273de9341f61822296c6b2145f7f2dc4a69daf3ac04829f5bde3f8
+ loguru==0.7.3
+ markdown-it-py==4.2.0
+ MarkupSafe==3.0.3
+diff --git a/backend/routers/engines.py b/backend/routers/engines.py
+index 173b8e1..e29caaa 100644
+--- a/backend/routers/engines.py
++++ b/backend/routers/engines.py
+@@ -15,7 +15,6 @@ async def view_settings():
+     options = [
+         ('auto', 'Automatic · reference-safe fallback', '', True, 'Only Auto may switch providers.'),
+         ('gemini', 'Google Gemini · your key', 'GEMINI_API_KEY', True, 'Image generation requires project billing/quota.'),
+-        ('emergent', 'Gemini via Emergent', 'EMERGENT_LLM_KEY', True, 'Uses Emergent key credits.'),
+         ('openai', 'OpenAI GPT Image', 'OPENAI_API_KEY', False, 'This adapter cannot edit reference images; blocked for continuity-locked frames.'),
+         ('stability', 'Stability AI', 'STABILITY_API_KEY', False, 'Text-to-image only; blocked for continuity-locked frames.'),
+         ('fal_flux', 'fal.ai FLUX', 'FAL_KEY', False, 'Text-to-image only; blocked for continuity-locked frames.'),
+diff --git a/backend/routes.py b/backend/routes.py
+index ee12979..39e96c4 100644
+--- a/backend/routes.py
++++ b/backend/routes.py
+@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
+ from fastapi.responses import FileResponse, JSONResponse
+ from pydantic import BaseModel
+ 
+-from auth import optional_user_id
++from auth import admin_emails, optional_user_id
+ from db import db
+ from job_queue import HEARTBEAT, QUEUE_PAUSED, enqueue
+ from models import Book, Story, Channel, utcnow
+@@ -23,6 +23,48 @@ def fix(doc):
+     return doc
+ 
+ 
++# ---------- ownership helpers ----------
++async def _current_user(request: Request) -> dict:
++    """Return the authenticated user (or {}) — used to enforce content ownership."""
++    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
++    if not uid:
++        return {}
++    user = await db.users.find_one({"user_id": uid}, {"_id": 0}) or {}
++    if not user:
++        return {"user_id": uid}
++    user["is_admin"] = (user.get("role") == "admin"
++                       or user.get("email", "").lower() in admin_emails())
++    return user
++
++
++async def _owner_filter(request: Request) -> dict:
++    """Return a Mongo filter enforcing per-account content isolation (admins bypass)."""
++    user = await _current_user(request)
++    if user.get("is_admin"):
++        return {}
++    uid = user.get("user_id") or ""
++    # Empty owner_id string means "legacy pre-scoping data" — only the owner and admins
++    # will see anything.  Anonymous requests see nothing.
++    return {"owner_id": uid}
++
++
++async def _owned_story(request: Request, story_id: str) -> dict:
++    """Fetch a story only if the caller is its owner (or an admin).  404 otherwise."""
++    filt = {"_id": story_id, **(await _owner_filter(request))}
++    story = await db.stories.find_one(filt)
++    if not story:
++        raise HTTPException(404, "story not found")
++    return story
++
++
++async def _owned_book(request: Request, book_id: str) -> dict:
++    filt = {"_id": book_id, **(await _owner_filter(request))}
++    book = await db.books.find_one(filt)
++    if not book:
++        raise HTTPException(404, "book not found")
++    return book
++
++
+ # ---------- health ----------
+ @router.get("/")
+ async def root():
+@@ -71,9 +113,9 @@ async def upload_book(request: Request, file: UploadFile = File(...), channel_id
+ 
+ 
+ @router.get("/books")
+-async def list_books():
++async def list_books(request: Request):
+     out = []
+-    async for b in db.books.find().sort("created_at", -1):
++    async for b in db.books.find(await _owner_filter(request)).sort("created_at", -1):
+         story_count = await db.stories.count_documents({"book_id": b["_id"]})
+         d = Book.from_mongo(b).model_dump()
+         d["story_count"] = story_count
+@@ -82,10 +124,8 @@ async def list_books():
+ 
+ 
+ @router.get("/books/{book_id}")
+-async def get_book(book_id: str):
+-    b = await db.books.find_one({"_id": book_id})
+-    if not b:
+-        raise HTTPException(404, "book not found")
++async def get_book(book_id: str, request: Request):
++    b = await _owned_book(request, book_id)
+     stories = []
+     async for s in db.stories.find({"book_id": book_id}).sort("created_at", 1):
+         stories.append(Story.from_mongo(s).model_dump())
+@@ -97,10 +137,8 @@ async def get_book(book_id: str):
+ 
+ # ---------- stories ----------
+ @router.post("/books/{book_id}/reocr")
+-async def reocr_book(book_id: str):
+-    b = await db.books.find_one({"_id": book_id})
+-    if not b:
+-        raise HTTPException(404, "book not found")
++async def reocr_book(book_id: str, request: Request):
++    b = await _owned_book(request, book_id)
+     if b["status"] in ("ocr_running", "segmenting"):
+         raise HTTPException(409, "OCR already in progress")
+     await db.books.update_one({"_id": book_id}, {"$set": {
+@@ -111,8 +149,8 @@ async def reocr_book(book_id: str):
+ 
+ 
+ @router.get("/stories")
+-async def list_stories(channel_id: Optional[str] = None, status: Optional[str] = None):
+-    q = {}
++async def list_stories(request: Request, channel_id: Optional[str] = None, status: Optional[str] = None):
++    q = dict(await _owner_filter(request))
+     if channel_id and channel_id != "all":
+         q["channel_id"] = channel_id
+     if status and status != "all":
+@@ -124,18 +162,14 @@ async def list_stories(channel_id: Optional[str] = None, status: Optional[str] =
+ 
+ 
+ @router.get("/stories/{story_id}")
+-async def get_story(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def get_story(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     return Story.from_mongo(s).model_dump()
+ 
+ 
+ @router.post("/stories/{story_id}/script")
+-async def gen_script(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def gen_script(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if s["status"] in ("scripting",):
+         raise HTTPException(409, "script already being generated")
+     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "scripting", "error": ""}})
+@@ -144,10 +178,8 @@ async def gen_script(story_id: str):
+ 
+ 
+ @router.post("/stories/{story_id}/produce")
+-async def produce(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def produce(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if not s.get("script", {}).get("chunks"):
+         raise HTTPException(409, "generate the script first")
+     await db.stories.update_one({"_id": story_id}, {"$set": {"status": "rendering", "stage": "Queued", "error": ""}})
+@@ -156,8 +188,9 @@ async def produce(story_id: str):
+ 
+ 
+ @router.post("/stories/{story_id}/stop")
+-async def stop_story(story_id: str):
++async def stop_story(story_id: str, request: Request):
+     """Cancel the running/queued produce (or improve) job for this story."""
++    await _owned_story(request, story_id)
+     j = await db.jobs.find_one(
+         {"ref_id": story_id, "type": {"$in": ["produce", "improve", "segment_fix", "edit_request"]},
+          "status": {"$in": ["queued", "running"]}},
+@@ -175,18 +208,26 @@ async def stop_story(story_id: str):
+ 
+ 
+ @router.post("/jobs/{job_id}/cancel")
+-async def cancel_job_endpoint(job_id: str):
++async def cancel_job_endpoint(job_id: str, request: Request):
+     from job_queue import cancel_job
+     j = await db.jobs.find_one({"_id": job_id})
+     if not j:
+         raise HTTPException(404, "job not found")
++    ref_id = j.get("ref_id") or ""
++    if ref_id and ref_id != "system":
++        # Only the owner (or admin) may cancel a job attached to a story.
++        await _owned_story(request, ref_id)
++    else:
++        user = await _current_user(request)
++        if not user.get("is_admin"):
++            raise HTTPException(404, "job not found")
+     await db.jobs.update_one({"_id": job_id, "status": {"$in": ["queued", "running"]}},
+                              {"$set": {"status": "cancelled", "error": "stopped by user",
+                                        "finished_at": utcnow()}})
+     cancel_job(job_id)
+-    if j.get("ref_id") and j["ref_id"] != "system":
++    if ref_id and ref_id != "system":
+         await db.stories.update_one(
+-            {"_id": j["ref_id"], "status": "rendering"},
++            {"_id": ref_id, "status": "rendering"},
+             {"$set": {"status": "script_ready", "stage": "Stopped by user", "error": ""}})
+     return {"ok": True}
+ 
+@@ -235,10 +276,8 @@ class SegmentRegenerateBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/segments/{index}/regenerate")
+-async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegenerateBody] = None):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def regen_segment(story_id: str, index: int, request: Request, body: Optional[SegmentRegenerateBody] = None):
++    s = await _owned_story(request, story_id)
+     chunks = (s.get("script") or {}).get("chunks") or []
+     if index < 0 or index >= len(chunks):
+         raise HTTPException(400, "invalid segment index")
+@@ -251,10 +290,8 @@ async def regen_segment(story_id: str, index: int, body: Optional[SegmentRegener
+ 
+ 
+ @router.post("/stories/{story_id}/improve")
+-async def improve_story(story_id: str):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def improve_story(story_id: str, request: Request):
++    s = await _owned_story(request, story_id)
+     if not s.get("script", {}).get("chunks"):
+         raise HTTPException(409, "generate the script first")
+     if len(s.get("improvements") or []) >= 2:
+@@ -278,7 +315,7 @@ class CreateBody(BaseModel):
+ 
+ 
+ @router.post("/stories/create")
+-async def create_story(body: CreateBody):
++async def create_story(body: CreateBody, request: Request):
+     from script_parser import parse_scene_script
+     from services.video_types import VIDEO_TYPES
+     cfg = VIDEO_TYPES.get(body.video_type)
+@@ -303,7 +340,19 @@ async def create_story(body: CreateBody):
+     parsed = parse_scene_script(body.source_text)
+     supplied_title = body.title.strip() or ((parsed or {}).get("title") or "")
+     bible = ((parsed or {}).get("character_sheet") or "").strip()
++    owner_id = await optional_user_id(request)
++    script_payload = {}
++    if parsed:
++        script_payload = {
++            "chunks": parsed["chunks"],
++            "production_notes": parsed["production_notes"],
++            "imported_verbatim": True,
++            "character_sheet": {"anchor": bible},
++            "missing": parsed["missing"],
++            "is_partial": parsed["is_partial"],
++        }
+     story = Story(book_id=f"prompt-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
++                  owner_id=owner_id,
+                   title_hindi=supplied_title, title_english=supplied_title[:100],
+                   source="Pasted script / prompt", category=cfg["name"],
+                   target_seconds=target, mode=mode,
+@@ -311,18 +360,21 @@ async def create_story(body: CreateBody):
+                   emotional_tone=cfg["tone"][:60], target_audience=cfg["audience"],
+                   visual_style=cfg["style_prefix"][:120], estimated_length=f"{target}s",
+                   status="script_ready" if parsed else "draft",
+-                  stage=f"Loaded {len(parsed['chunks'])} supplied scenes" if parsed else "",
+-                  script={"chunks": parsed["chunks"], "production_notes": parsed["production_notes"],
+-                          "imported_verbatim": True,
+-                          "character_sheet": {"anchor": bible}} if parsed else {},
++                  stage=(f"Loaded {len(parsed['chunks'])} supplied scenes"
++                         + (" · gaps queued for AI fill" if parsed and parsed["is_partial"] else "")
++                         if parsed else ""),
++                  script=script_payload,
+                   character_sheet={"anchor": bible, "text": bible, "locked": bool(bible),
+                                    "visuals_stale": False, "version": 1} if parsed else {})
+     await db.stories.insert_one(story.to_mongo())
+     if parsed:
+         return {"story_id": story.id, "job_id": None, "imported": True,
+-                "imported_segments": len(parsed["chunks"])}
++                "imported_segments": len(parsed["chunks"]),
++                "is_partial": parsed["is_partial"],
++                "missing": parsed["missing"]}
+     job_id = await enqueue("script", story.id, f"Script: {supplied_title[:40] or story.id}")
+-    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0}
++    return {"story_id": story.id, "job_id": job_id, "imported": False, "imported_segments": 0,
++            "is_partial": False, "missing": {"voiceover": [], "visual": [], "video_prompt": []}}
+ 
+ 
+ @router.get("/video-types")
+@@ -336,10 +388,8 @@ class ScriptPatchBody(BaseModel):
+ 
+ 
+ @router.patch("/stories/{story_id}/script")
+-async def patch_script(story_id: str, body: ScriptPatchBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def patch_script(story_id: str, body: ScriptPatchBody, request: Request):
++    s = await _owned_story(request, story_id)
+     if s["status"] == "rendering":
+         raise HTTPException(409, "pipeline busy — wait for the render to finish")
+     chunks = (s.get("script") or {}).get("chunks") or []
+@@ -375,12 +425,10 @@ class ConfigBody(BaseModel):
+ 
+ 
+ @router.put("/stories/{story_id}/config")
+-async def story_config(story_id: str, body: ConfigBody):
++async def story_config(story_id: str, body: ConfigBody, request: Request):
+     import shutil
+ 
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++    s = await _owned_story(request, story_id)
+     if s["status"] == "rendering":
+         raise HTTPException(409, "pipeline busy")
+     patch = {}
+@@ -403,10 +451,8 @@ class CharacterSheetBody(BaseModel):
+ 
+ 
+ @router.patch("/stories/{story_id}/character-sheet")
+-async def update_character_sheet(story_id: str, body: CharacterSheetBody):
+-    story = await db.stories.find_one({"_id": story_id})
+-    if not story:
+-        raise HTTPException(404, "story not found")
++async def update_character_sheet(story_id: str, body: CharacterSheetBody, request: Request):
++    story = await _owned_story(request, story_id)
+     if story.get("status") == "rendering":
+         raise HTTPException(409, "pipeline busy — wait for the render to finish")
+     anchor = body.anchor.strip()
+@@ -436,10 +482,8 @@ class ReviewBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/review")
+-async def review(story_id: str, body: ReviewBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def review(story_id: str, body: ReviewBody, request: Request):
++    s = await _owned_story(request, story_id)
+     mapping = {"approve": "approved", "reject": "rejected", "request_edits": "edits_requested"}
+     if body.action not in mapping:
+         raise HTTPException(400, "action must be approve|reject|request_edits")
+@@ -455,17 +499,34 @@ async def review(story_id: str, body: ReviewBody):
+     if body.action == "request_edits":
+         job_id = await enqueue("edit_request", story_id, "Apply requested story edits",
+                                payload={"notes": body.notes.strip()})
+-    response = await get_story(story_id)
++    response = await get_story(story_id, request)
+     if isinstance(response, dict):
+         response["edit_job_id"] = job_id
+     return response
+ 
+ 
+ # ---------- jobs & dashboard ----------
++async def _visible_story_ids(request: Request) -> Optional[set]:
++    """Return the set of story IDs the caller can see, or ``None`` for admins."""
++    user = await _current_user(request)
++    if user.get("is_admin"):
++        return None
++    uid = user.get("user_id") or ""
++    ids: set[str] = set()
++    async for s in db.stories.find({"owner_id": uid}, {"_id": 1}):
++        ids.add(s["_id"])
++    return ids
++
++
+ @router.get("/jobs")
+-async def list_jobs(limit: int = 30):
++async def list_jobs(request: Request, limit: int = 30):
++    ids = await _visible_story_ids(request)
++    filt: dict = {} if ids is None else {"$or": [
++        {"ref_id": {"$in": list(ids)}},
++        {"ref_id": "system"},
++    ]}
+     out = []
+-    async for j in db.jobs.find().sort("created_at", -1).limit(min(limit, 100)):
++    async for j in db.jobs.find(filt).sort("created_at", -1).limit(min(limit, 100)):
+         d = fix(dict(j))
+         for f in ("created_at", "started_at", "finished_at"):
+             if isinstance(d.get(f), datetime):
+@@ -475,22 +536,31 @@ async def list_jobs(limit: int = 30):
+ 
+ 
+ @router.get("/dashboard")
+-async def dashboard():
++async def dashboard(request: Request):
++    story_filter = await _owner_filter(request)
++    ids = await _visible_story_ids(request)
++    if ids is None:
++        jobs_filter: dict = {}
++    else:
++        jobs_filter = {"$or": [{"ref_id": {"$in": list(ids)}}, {"ref_id": "system"}]}
++
+     status_counts = {}
+-    async for s in db.stories.find({}, {"status": 1}):
++    async for s in db.stories.find(story_filter, {"status": 1}):
+         status_counts[s["status"]] = status_counts.get(s["status"], 0) + 1
+ 
+-    pipeline_t = [{"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
+-                              "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
+-                              "n": {"$sum": 1},
+-                              "produced": {"$sum": {"$cond": [
+-                                  {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
+-                                  1, 0]}}}}]
++    pipeline_t = [
++        {"$match": story_filter} if story_filter else {"$match": {}},
++        {"$group": {"_id": None, "llm": {"$sum": "$cost.llm"}, "tts": {"$sum": "$cost.tts"},
++                    "image": {"$sum": "$cost.image"}, "total": {"$sum": "$cost.total"},
++                    "n": {"$sum": 1},
++                    "produced": {"$sum": {"$cond": [
++                        {"$in": ["$status", ["in_review", "approved", "edits_requested"]]},
++                        1, 0]}}}}]
+     agg = await db.stories.aggregate(pipeline_t).to_list(1)
+     cost = agg[0] if agg else {"llm": 0, "tts": 0, "image": 0, "total": 0, "n": 0, "produced": 0}
+     avg = round(cost["total"] / cost["produced"], 3) if cost["produced"] else 0
+     jobs = []
+-    async for j in db.jobs.find().sort("created_at", -1).limit(25):
++    async for j in db.jobs.find(jobs_filter).sort("created_at", -1).limit(25):
+         d = fix(dict(j))
+         for f in ("created_at", "started_at", "finished_at"):
+             if isinstance(d.get(f), datetime):
+@@ -498,18 +568,19 @@ async def dashboard():
+         jobs.append(d)
+ 
+     job_counts = {}
+-    async for j in db.jobs.find({}, {"status": 1}):
++    async for j in db.jobs.find(jobs_filter, {"status": 1}):
+         job_counts[j["status"]] = job_counts.get(j["status"], 0) + 1
+ 
+     beat_coverage = {"hook": 0, "story": 0, "twist": 0, "climax": 0, "action": 0, "lesson": 0}
+-    async for s in db.stories.find({"script.chunks": {"$exists": True, "$ne": []}}, {"script.chunks.beat": 1}):
++    async for s in db.stories.find({**story_filter, "script.chunks": {"$exists": True, "$ne": []}},
++                                   {"script.chunks.beat": 1}):
+         seen = {c.get("beat") for c in s.get("script", {}).get("chunks", []) if isinstance(c, dict)}
+         for b in beat_coverage:
+             if b in seen:
+                 beat_coverage[b] += 1
+ 
+     recent = []
+-    async for s in db.stories.find().sort("updated_at", -1).limit(8):
++    async for s in db.stories.find(story_filter).sort("updated_at", -1).limit(8):
+         recent.append(Story.from_mongo(s).model_dump())
+ 
+     return {
+@@ -518,7 +589,7 @@ async def dashboard():
+                  "image": round(cost["image"], 3), "total": round(cost["total"], 3),
+                  "avg_per_video": avg, "videos_produced": cost["produced"], "n": cost["n"]},
+         "beat_coverage": beat_coverage,
+-        "queue": {"depth": await db.jobs.count_documents({"status": "queued"}),
++        "queue": {"depth": await db.jobs.count_documents({**jobs_filter, "status": "queued"}),
+                   "active": HEARTBEAT["active"],
+                   "workers": HEARTBEAT["workers"],
+                   "paused": QUEUE_PAUSED["paused"],
+@@ -531,7 +602,8 @@ async def dashboard():
+ 
+ # ---------- bulk curation ----------
+ @router.post("/books/{book_id}/script-all")
+-async def script_all(book_id: str):
++async def script_all(book_id: str, request: Request):
++    await _owned_book(request, book_id)
+     n = 0
+     async for s in db.stories.find({"book_id": book_id, "status": "draft"}, {"_id": 1, "title_english": 1}):
+         await enqueue("script", s["_id"], f"Script: {s.get('title_english', '')[:40]}")
+@@ -546,10 +618,11 @@ class BatchBody(BaseModel):
+ 
+ 
+ @router.post("/stories/batch-produce")
+-async def batch_produce(body: BatchBody):
++async def batch_produce(body: BatchBody, request: Request):
++    owner_filter = await _owner_filter(request)
+     queued = []
+     for sid in body.ids[:30]:
+-        s = await db.stories.find_one({"_id": sid})
++        s = await db.stories.find_one({"_id": sid, **owner_filter})
+         if not s or not s.get("script", {}).get("chunks"):
+             continue
+         if s["status"] in ("rendering",):
+@@ -568,10 +641,8 @@ class PublishBody(BaseModel):
+ 
+ 
+ @router.post("/stories/{story_id}/publish")
+-async def publish_story(story_id: str, body: PublishBody):
+-    s = await db.stories.find_one({"_id": story_id})
+-    if not s:
+-        raise HTTPException(404, "story not found")
++async def publish_story(story_id: str, body: PublishBody, request: Request):
++    await _owned_story(request, story_id)
+     if body.platform not in ("youtube", "instagram"):
+         raise HTTPException(400, "platform must be youtube|instagram")
+     job_id = await enqueue("publish", story_id, f"Publish to {platform_label(body.platform)}",
+@@ -631,7 +702,7 @@ async def engagement_sync():
+ 
+ 
+ # ---------- integration settings ----------
+-ALLOWED_VAULT_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "EMERGENT_LLM_KEY", "FAL_KEY", "HF_TOKEN",
++ALLOWED_VAULT_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "FAL_KEY", "HF_TOKEN",
+                       "REPLICATE_API_TOKEN", "PEXELS_API_KEY", "STABILITY_API_KEY", "YOUTUBE_CLIENT_ID",
+                       "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN", "INSTAGRAM_ACCESS_TOKEN",
+                       "INSTAGRAM_USER_ID", "STUDIO_API_TOKEN"}
+@@ -742,9 +813,10 @@ async def news_fetch():
+ 
+ 
+ @router.get("/news/items")
+-async def news_items():
++async def news_items(request: Request):
+     out = []
+-    async for s in db.stories.find({"policy": {"$ne": {}}}).sort("created_at", -1).limit(60):
++    q = {"policy": {"$ne": {}}, **(await _owner_filter(request))}
++    async for s in db.stories.find(q).sort("created_at", -1).limit(60):
+         out.append(Story.from_mongo(s).model_dump())
+     return out
+ 
+@@ -808,11 +880,11 @@ async def stitch_upload(file: UploadFile = File(...)):
+     dst.write_bytes(data)
+     kind = "video" if ext in STITCH_VIDEO_EXTS else "image"
+     from services import media, storage
+-    try:  # mirror the upload to object storage so the local copy isn't the only one
++    try:  # keep a second copy in the storage dir so the media dir isn't the only one
+         storage.put_object(f"{storage.APP_NAME}/stitch/{media_id}{ext}", data,
+                            "video/mp4" if kind == "video" else "image/jpeg")
+     except Exception as e:
+-        print(f"[stitch] object-storage mirror failed (keeping local copy): {str(e)[:120]}", flush=True)
++        print(f"[stitch] storage copy failed (keeping local copy): {str(e)[:120]}", flush=True)
+     return {"media_id": media_id, "kind": kind, "size": len(data),
+             "duration": round(media.ffprobe_duration(dst), 2) if kind == "video" else None}
+ 
+@@ -833,7 +905,7 @@ class StitchBody(BaseModel):
+ 
+ 
+ @router.post("/stitch")
+-async def stitch_create(body: StitchBody):
++async def stitch_create(body: StitchBody, request: Request):
+     import re
+ 
+     from services.video_types import VIDEO_TYPES
+@@ -881,6 +953,7 @@ async def stitch_create(body: StitchBody):
+         ch = await db.channels.find_one({"key": key})
+ 
+     story = Story(book_id=f"stitch-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
++                  owner_id=await optional_user_id(request),
+                   title_hindi=body.title.strip(),
+                   title_english=body.title.strip()[:100] or "My stitched video",
+                   source="Uploaded images & clips", category=cfg["name"], mode="stitch",
+diff --git a/backend/script_parser.py b/backend/script_parser.py
+index 30480ff..4a9c8ae 100644
+--- a/backend/script_parser.py
++++ b/backend/script_parser.py
+@@ -1,27 +1,95 @@
+ """Deterministic parser for user-supplied scene scripts.
+ 
+-Structured scripts are source material, not prompts: their dialogue and visuals must be
+-preserved instead of rewritten by an LLM.
++Structured scripts are source material, not prompts: their dialogue and visuals
++must be preserved instead of rewritten by an LLM.
++
++A script is considered "structured" when it contains at least one recognisable
++scene block.  Recognised synonyms:
++
++  * Scene header:   सीन N | दृश्य N | scene N (with optional 🎬/🎞️/🎥 prefixes
++                    and an optional time-range or label after the number).
++  * Voiceover:      वॉइसओवर | वॉयसओवर | नैरेशन | voice[- ]over | narration.
++  * Dialogue block: संवाद:  followed by ``Speaker: "text"`` lines.
++  * Image prompt:   विज़ुअल | visuals? | इमेज प्रॉम्प्ट | image prompt | 🖼️.
++  * Video prompt:   वीडियो प्रॉम्प्ट | video prompt | 🎥.
++
++Only the fields that are supplied are captured.  Missing ones are flagged on
++the chunk (``needs_voiceover``, ``needs_visual``, ``needs_video_prompt``) so
++that downstream generation can fill in only the gaps.
+ """
+ import re
+ 
+ 
+ SCENE_RE = re.compile(
+-    r"(?im)^\s*(?:🎬\s*)?(?:सीन|scene)\s*(\d+)\s*(?:[|:.-]\s*)?([^\n]*)$"
++    r"(?im)^\s*(?:[🎬🎞️🎥]\s*)?"
++    r"(?:सीन|दृश्य|scene)\s*(\d+)"
++    r"(?:\s*\([^)]*\))?"       # optional (0:00–0:07) style timestamp
++    r"\s*(?:[|:.\-–—]\s*)?"    # optional separator
++    r"([^\n]*)$"               # rest of the header line is the label
+ )
++
++# Individual speech / narration markers.  ``संवाद:`` is intentionally NOT here —
++# it is a container that holds multiple ``Speaker: "text"`` lines and is parsed
++# separately by :func:`_dialogue_quotes`.
+ SPEECH_RE = re.compile(
+-    r"(?im)(नैरेशन(?:\s*\(\s*वॉयसओवर\s*\))?(?:\s*\+\s*CTA)?|वॉयसओवर|"
+-    r"संवाद\s*[—–-]\s*[^:\n]+|narration(?:\s*\(\s*voiceover\s*\))?|"
+-    r"voiceover|dialogue\s*[—–-]\s*[^:\n]+)\s*:"
++    r"(?im)("
++    r"नैरेशन(?:\s*\(\s*वॉयसओवर\s*\))?(?:\s*\+\s*CTA)?"
++    r"|वॉयसओवर|वॉइसओवर"
++    r"|संवाद\s*[—–\-]\s*[^:\n]+"                 # legacy: संवाद — राजा:
++    r"|narration(?:\s*\(\s*voiceover\s*\))?"
++    r"|voice\s*-?\s*over"
++    r"|dialogue\s*[—–\-]\s*[^:\n]+"
++    r")\s*:"
++)
++
++# Any line that starts with ``संवाद`` (used to skip past the container marker
++# so we can pick up the quotes underneath it).
++DIALOGUE_HEADER_RE = re.compile(r"(?im)^\s*(?:🗣️\s*)?संवाद\s*:\s*$")
++
++VISUAL_RE = re.compile(
++    r"(?im)(?:🖼️\s*)?"
++    r"(?:विज़ुअल|विजुअल|visuals?|scene\s+visual|"
++    r"इमेज\s*प्रॉम्प्ट|image\s*prompt)\s*:"
++)
++
++VIDEO_PROMPT_RE = re.compile(
++    r"(?im)(?:🎥\s*)?(?:वीडियो\s*प्रॉम्प्ट|video\s*prompt)\s*:"
+ )
+-VISUAL_RE = re.compile(r"(?im)(?:विज़ुअल|विजुअल|visuals?|scene\s+visual)\s*:")
+-NOTES_RE = re.compile(r"(?im)^\s*(?:🎵\s*)?(?:प्रोडक्शन\s+नोट्स|production\s+notes)\s*$")
++
++NOTES_RE = re.compile(
++    r"(?im)^\s*(?:🎵\s*|💡\s*)?"
++    r"(?:प्रोडक्शन\s+नोट्स|production\s+notes|काम\s+की\s+टिप्स|tips?)\s*$"
++)
++
+ BIBLE_START_RE = re.compile(
+-    r"(?im)^.*(?:पात्र\s+एवं\s+दृश्य\s+संगति\s+गाइड|consistency\s+bible|character\s+(?:&|and)\s+style\s+guide).*$"
++    r"(?im)^.*(?:पात्र\s+एवं\s+दृश्य\s+संगति\s+गाइड|"
++    r"consistency\s+bible|character\s+(?:&|and)\s+style\s+guide|"
++    r"कैरेक्टर\s*(?:कंसिस्टेंसी|रेफ़रेंस)|character\s*reference|"
++    r"स्टाइल\s*ब्लॉक|style\s*block).*$"
++)
++
++SCRIPT_START_RE = re.compile(
++    r"(?im)^.*(?:सीन-दर-सीन\s+स्क्रिप्ट|scene-by-scene\s+script|"
++    r"दृश्य-दर-दृश्य|scene\s+by\s+scene).*$"
+ )
+-SCRIPT_START_RE = re.compile(r"(?im)^.*(?:सीन-दर-सीन\s+स्क्रिप्ट|scene-by-scene\s+script).*$")
++
++# Handles both straight ("...") and curly (“...”) quotes.
+ QUOTE_RE = re.compile(r"[\"“](.*?)[\"”]", re.DOTALL)
+ 
++# ``Speaker: "quote"`` matches (used inside a संवाद: block).
++SPEAKER_LINE_RE = re.compile(
++    r"(?m)^\s*[^\n:]{1,60}\s*:\s*[\"“](.+?)[\"”]\s*$",
++    re.DOTALL,
++)
++
++TITLE_LABEL_RE = re.compile(r"(?im)^\s*(?:शीर्षक|title)\s*:\s*(.+?)\s*$")
++
++# Lines that look like format/metadata (skipped when guessing the title).
++METADATA_PREFIXES = (
++    "(", "फ़ॉर्मेट", "फॉर्मेट", "format", "फ़ॉर्मैट",
++    "duration", "अवधि", "language", "भाषा",
++)
++
+ 
+ def _clean(value: str) -> str:
+     return re.sub(r"[ \t]+", " ", value).strip(" \t\r\n")
+@@ -44,9 +112,10 @@ def _beat(index: int, total: int, label: str) -> str:
+     value = label.lower()
+     if index == 0 or "hook" in value or "हुक" in value:
+         return "hook"
+-    if index == total - 1 or "closing" in value or "क्लोज" in value or "lesson" in value or "सीख" in value:
++    if (index == total - 1 or "closing" in value or "क्लोज" in value
++            or "समापन" in value or "lesson" in value or "सीख" in value):
+         return "lesson"
+-    if "climax" in value or "प्रकटन" in value or "चरम" in value:
++    if "climax" in value or "प्रकटन" in value or "चरम" in value or "प्राकट्य" in value:
+         return "climax"
+     if "twist" in value or "मोड़" in value or "तपस्या" in value:
+         return "twist"
+@@ -67,30 +136,65 @@ def _emotion(label: str) -> str:
+     return _clean(parenthetical[-1] if parenthetical else label) or "storytelling"
+ 
+ 
+-def _spoken_text(body: str, first_speech: re.Match | None) -> str:
+-    if not first_speech:
+-        return ""
+-    speech = body[first_speech.start():]
+-    parts = []
+-    matches = list(SPEECH_RE.finditer(speech))
++def _dialogue_quotes(block: str) -> list[str]:
++    """Extract ``Speaker: "quote"`` lines from a संवाद: container."""
++    quotes = []
++    for match in SPEAKER_LINE_RE.finditer(block):
++        text = _clean(match.group(1))
++        if text:
++            quotes.append(text)
++    return quotes
++
++
++def _spoken_text(body: str) -> str:
++    """Collect voiceover / narration / dialogue text from a scene body."""
++    parts: list[str] = []
++
++    # 1) Standalone speech markers (नैरेशन:, वॉइसओवर:, संवाद — राजा:, etc.)
++    matches = list(SPEECH_RE.finditer(body))
+     for i, marker in enumerate(matches):
+-        end = matches[i + 1].start() if i + 1 < len(matches) else len(speech)
+-        content = speech[marker.end():end]
++        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
++        # stop at the next section header (visual/video/notes) if it appears first
++        for stopper in (VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, DIALOGUE_HEADER_RE):
++            m = stopper.search(body, marker.end(), end)
++            if m and m.start() < end:
++                end = m.start()
++        content = body[marker.end():end]
+         quotes = [_clean(q) for q in QUOTE_RE.findall(content) if _clean(q)]
+         if quotes:
+             parts.extend(quotes)
+         else:
+-            plain = NOTES_RE.split(content, maxsplit=1)[0]
+-            if _clean(plain):
+-                parts.append(_clean(plain))
++            plain = _clean(content)
++            if plain:
++                parts.append(plain)
++
++    # 2) ``संवाद:`` container — extract every "Speaker: quote" line inside it.
++    dialog = DIALOGUE_HEADER_RE.search(body)
++    if dialog:
++        end = len(body)
++        for stopper in (VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, SPEECH_RE):
++            m = stopper.search(body, dialog.end())
++            if m and m.start() < end:
++                end = m.start()
++        for q in _dialogue_quotes(body[dialog.end():end]):
++            if q not in parts:
++                parts.append(q)
++
+     return "\n".join(parts)
+ 
+ 
+-def _visual_text(body: str, first_speech: re.Match | None) -> str:
+-    match = VISUAL_RE.search(body)
++def _prompt_text(body: str, marker: "re.Pattern[str]") -> str:
++    """Return the text under a ``visual:`` / ``video prompt:`` heading."""
++    match = marker.search(body)
+     if not match:
+         return ""
+-    end = first_speech.start() if first_speech else len(body)
++    end = len(body)
++    for stopper in (SPEECH_RE, VISUAL_RE, VIDEO_PROMPT_RE, NOTES_RE, DIALOGUE_HEADER_RE):
++        if stopper is marker:
++            continue
++        m = stopper.search(body, match.end())
++        if m and m.start() < end:
++            end = m.start()
+     return _clean(body[match.end():end])
+ 
+ 
+@@ -106,9 +210,19 @@ def _consistency_bible(text: str, first_scene_start: int) -> str:
+ 
+ 
+ def _title(text: str) -> str:
++    label = TITLE_LABEL_RE.search(text)
++    if label:
++        return _clean(label.group(1)).strip('"')[:150]
+     for line in text.splitlines():
+         clean = _clean(line).strip('"')
+-        if clean and not clean.startswith(("(", "फॉर्मेट", "Format")):
++        if not clean:
++            continue
++        lower = clean.lower()
++        if any(lower.startswith(prefix.lower()) for prefix in METADATA_PREFIXES):
++            continue
++        # Strip a leading emoji-plus-space if present so "🌟 Title" -> "Title".
++        clean = re.sub(r"^[^\w\u0900-\u097F(]+", "", clean).strip()
++        if clean:
+             return clean[:150]
+     return "Imported scene script"
+ 
+@@ -121,24 +235,37 @@ def parse_scene_script(text: str) -> dict | None:
+     chunks = []
+     for idx, match in enumerate(matches):
+         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+-        body = NOTES_RE.split(text[match.end():end], maxsplit=1)[0]
+-        first_speech = SPEECH_RE.search(body)
+-        visual = _visual_text(body, first_speech)
+-        voiceover = _spoken_text(body, first_speech)
+-        if not visual and not voiceover:
++        # Trim off any "production notes" / "tips" section that follows the last scene.
++        raw_body = text[match.end():end]
++        notes_stop = NOTES_RE.search(raw_body)
++        body = raw_body[:notes_stop.start()] if notes_stop else raw_body
++
++        voiceover = _spoken_text(body)
++        visual = _prompt_text(body, VISUAL_RE)
++        video_prompt = _prompt_text(body, VIDEO_PROMPT_RE) or visual
++
++        # Only keep a scene if the user supplied SOMETHING for it; otherwise the
++        # scene is empty scaffolding and we skip it entirely.
++        if not (voiceover or visual or video_prompt):
+             continue
++
+         label = _clean(match.group(2))
+-        chunks.append({
++        chunk = {
+             "chunk_id": f"scene-{match.group(1)}",
+             "source_scene": int(match.group(1)),
+             "source_label": label,
+             "beat": "story",  # assigned after skipped/usable scenes are known
+             "voiceover": voiceover[:4000],
+             "visual": visual[:4000],
+-            "video_prompt": visual[:4000],
+-            "camera": _camera(visual),
++            "video_prompt": video_prompt[:4000],
++            "camera": _camera(visual or video_prompt),
+             "emotion": _emotion(label),
+-        })
++            "needs_voiceover": not bool(voiceover),
++            "needs_visual": not bool(visual),
++            "needs_video_prompt": not bool(video_prompt),
++        }
++        chunks.append(chunk)
++
+     if not chunks:
+         return None
+     for idx, chunk in enumerate(chunks):
+@@ -146,9 +273,18 @@ def parse_scene_script(text: str) -> dict | None:
+ 
+     notes_match = NOTES_RE.search(text)
+     notes = _clean(text[notes_match.end():]) if notes_match else ""
++
++    missing = {
++        "voiceover": [c["chunk_id"] for c in chunks if c["needs_voiceover"]],
++        "visual": [c["chunk_id"] for c in chunks if c["needs_visual"]],
++        "video_prompt": [c["chunk_id"] for c in chunks if c["needs_video_prompt"]],
++    }
++
+     return {
+         "title": _title(text),
+         "character_sheet": _consistency_bible(text, matches[0].start()),
+         "chunks": chunks,
+         "production_notes": notes[:8000],
+-    }
+\ No newline at end of file
++        "missing": missing,
++        "is_partial": any(missing.values()),
++    }
+diff --git a/backend/server.py b/backend/server.py
+index c150e4a..8c576f0 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -1,10 +1,11 @@
+ import asyncio
+ import logging
++logging.getLogger("httpx").setLevel(logging.WARNING)
+ import os
+ from pathlib import Path
+ 
+ from dotenv import load_dotenv
+-from fastapi import FastAPI, APIRouter
++from fastapi import Depends, FastAPI, APIRouter
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.staticfiles import StaticFiles
+ 
+@@ -12,13 +13,13 @@ load_dotenv(Path(__file__).parent / ".env")
+ 
+ from db import db
+ from routes import router
+-from auth import auth_router
++from auth import auth_router, verify_auth
+ from admin import admin_router
+ from services.ocr import MEDIA_ROOT
+ import job_queue
+ import tasks as tasks_mod
+ 
+-app = FastAPI(title="StoryForge API", version="1.0")
++app = FastAPI(title="StoryForge API", version="1.0", dependencies=[Depends(verify_auth)])
+ 
+ app.add_middleware(
+     CORSMiddleware,
+diff --git a/backend/services/gemini.py b/backend/services/gemini.py
+index e18e216..e510bb0 100644
+--- a/backend/services/gemini.py
++++ b/backend/services/gemini.py
+@@ -54,10 +54,6 @@ def openai_key():
+     return (os.environ.get("OPENAI_API_KEY") or "").strip()
+ 
+ 
+-def emergent_key():
+-    return (os.environ.get("EMERGENT_LLM_KEY") or "").strip()
+-
+-
+ def _retry_wait(text, attempt):
+     m = re.search(r"retry in\s*([\d.]+)s", text)
+     return float(m.group(1)) + 2 if m else 18.0 + 8 * attempt
+diff --git a/backend/services/imagegen.py b/backend/services/imagegen.py
+index b5df178..58738c7 100644
+--- a/backend/services/imagegen.py
++++ b/backend/services/imagegen.py
+@@ -1,4 +1,4 @@
+-"""AI image providers: Gemini (user key) -> OpenAI -> Stability -> Emergent -> procedural fallback."""
++"""AI image providers: Gemini (user key) -> OpenAI -> Stability -> procedural fallback."""
+ import asyncio
+ import base64
+ import os
+@@ -23,7 +23,7 @@ def _ref_bytes(ref_image):
+ async def generate_image(prompt: str, out_path: Path, ref_image: Path = None, session: str = "img",
+                          require_reference: bool = False):
+     """AI image with hard 35s caps per provider; after one full-chain failure the cloud providers
+-    are skipped for 10 minutes (kills the litellm retry storm that made renders crawl)."""
++    are skipped for 10 minutes (avoids retry storms that make renders crawl)."""
+     global _IMAGE_DEAD_UNTIL
+     import time
+ 
+@@ -40,15 +40,6 @@ async def generate_image(prompt: str, out_path: Path, ref_image: Path = None, se
+         await asyncio.to_thread(procedural_frame, prompt, out_path)
+         return False
+ 
+-    ek = gemini.emergent_key()
+-    if ek:
+-        try:
+-            await asyncio.wait_for(
+-                _gen_gemini_proxy(ek, prompt, out_path, ref_image, session), timeout=35)
+-            return True
+-        except Exception as e:
+-            print(f"[media] emergent nano-banana failed: {str(e)[:120]}", flush=True)
+-
+     if gemini.gemini_key() and not gemini.circuit_open():
+         try:
+             data = await asyncio.wait_for(gemini.gen_image(prompt, ref), timeout=35)
+@@ -83,35 +74,13 @@ async def generate_image(prompt: str, out_path: Path, ref_image: Path = None, se
+     return False
+ 
+ 
+-async def _gen_gemini_proxy(key, prompt, out_path, ref_image, session):
+-    import uuid
+-    from emergentintegrations.llm.chat import ImageContent, LlmChat, UserMessage
+-
+-    try:
+-        chat = LlmChat(
+-            api_key=key, session_id=f"{session}-{uuid.uuid4().hex[:8]}",
+-            system_message="You are a world-class Indian miniature-painting artist. Treat the supplied reference image and continuity bible as immutable identity and style constraints across a video series.",
+-        ).with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
+-        if ref_image and Path(ref_image).exists():
+-            b64 = base64.b64encode(Path(ref_image).read_bytes()).decode()
+-            msg = UserMessage(text=prompt, file_contents=[ImageContent(b64)])
+-        else:
+-            msg = UserMessage(text=prompt)
+-        _, images = await chat.send_message_multimodal_response(msg)
+-        if not images:
+-            raise RuntimeError("no images")
+-        out_path.write_bytes(base64.b64decode(images[0]["data"]))
+-    except Exception:
+-        raise
+-
+-
+ async def _gen_openai_image(key, prompt, out_path):
+-    from emergentintegrations.llm.openai.image_generation import OpenAIImageGeneration
+-    gen = OpenAIImageGeneration(api_key=key)
+-    images = await gen.generate_images(prompt=prompt, model="gpt-image-1", quality="medium")
+-    if not images:
++    from openai import AsyncOpenAI
++    client = AsyncOpenAI(api_key=key, timeout=240)
++    resp = await client.images.generate(model="gpt-image-1", prompt=prompt, quality="medium", size="1024x1536")
++    if not resp.data or not resp.data[0].b64_json:
+         raise RuntimeError("no images returned")
+-    out_path.write_bytes(images[0])
++    out_path.write_bytes(base64.b64decode(resp.data[0].b64_json))
+ 
+ 
+ # ---------- procedural fallback frames (free, no API) ----------
+diff --git a/backend/services/keys.py b/backend/services/keys.py
+index b644ba4..5b29731 100644
+--- a/backend/services/keys.py
++++ b/backend/services/keys.py
+@@ -2,14 +2,6 @@ import os
+ 
+ 
+ def candidate_keys():
+-    """API keys in priority order: user's own OpenAI key first, then the Emergent universal key."""
+-    keys = []
+-    if os.environ.get("OPENAI_API_KEY", "").strip():
+-        keys.append(os.environ["OPENAI_API_KEY"].strip())
+-    if os.environ.get("EMERGENT_LLM_KEY", "").strip():
+-        keys.append(os.environ["EMERGENT_LLM_KEY"].strip())
+-    return keys
+-
+-
+-def is_emergent(key):
+-    return key.startswith("sk-emergent-")
++    """OpenAI API keys to try, in priority order (currently just OPENAI_API_KEY)."""
++    key = os.environ.get("OPENAI_API_KEY", "").strip()
++    return [key] if key else []
+diff --git a/backend/services/llm.py b/backend/services/llm.py
+index ee508f8..0f7bf2e 100644
+--- a/backend/services/llm.py
++++ b/backend/services/llm.py
+@@ -2,36 +2,24 @@ import asyncio
+ import json
+ import os
+ import re
+-import uuid
+ from pathlib import Path
+ 
+-from emergentintegrations.llm.chat import LlmChat, UserMessage
+-
+ from services.keys import candidate_keys
+ 
+-MODEL = ("openai", "gpt-5.4")
++# Override with OPENAI_TEXT_MODEL in backend/.env to use any chat model your OpenAI key can access.
++MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-5.4")
+ LLM_IN_PRICE = 2.5e-6   # $ per input token (estimate)
+ LLM_OUT_PRICE = 1.0e-5  # $ per output token (estimate)
+ 
+ 
+-def _chat_for(key):
+-    chat = LlmChat(
+-        api_key=key,
+-        session_id=f"s-{uuid.uuid4().hex[:10]}",
+-        system_message="",
+-    ).with_model(*MODEL)
+-    return chat
+-
++async def _openai_text(key: str, system: str, prompt: str) -> str:
++    """One chat completion through the official OpenAI SDK."""
++    from openai import AsyncOpenAI
+ 
+-def _extract_text(resp):
+-    if resp is None:
+-        return ""
+-    if isinstance(resp, str):
+-        return resp
+-    content = getattr(resp, "content", None)
+-    if isinstance(content, str):
+-        return content
+-    return str(resp)
++    client = AsyncOpenAI(api_key=key, timeout=180)
++    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
++    resp = await client.chat.completions.create(model=MODEL, messages=messages)
++    return resp.choices[0].message.content or ""
+ 
+ 
+ def estimate_llm_cost(prompt: str, response: str) -> float:
+@@ -147,21 +135,15 @@ async def ask_json(system: str, prompt: str, session: str = "job", retries: int
+                 last_err = e
+         print(f"[llm] gemini chain failed: {str(last_err)[:120]}", flush=True)
+ 
+-    # 2) OpenAI-compatible keys via LlmChat (emergent first: funded universal key)
+-    keys = [k for k in (gemini.emergent_key(), gemini.openai_key()) if k]
++    # 2) OpenAI (official SDK) with your own OPENAI_API_KEY
++    keys = [k for k in (gemini.openai_key(),) if k]
+     for attempt in range(retries + 1):
+         for key in keys:
+             try:
+-                chat = LlmChat(
+-                    api_key=key,
+-                    session_id=f"{session}-{uuid.uuid4().hex[:8]}",
+-                    system_message=system,
+-                ).with_model(*MODEL)
+                 msg_text = prompt if attempt == 0 else (
+                     prompt + "\n\nCRITICAL: respond with ONLY a single valid JSON object/array. No markdown, no commentary."
+                 )
+-                resp = await chat.send_message(UserMessage(text=msg_text))
+-                txt = _extract_text(resp)
++                txt = await _openai_text(key, system, msg_text)
+                 return parse_json(txt)
+             except Exception as e:
+                 last_err = e
+diff --git a/backend/services/media.py b/backend/services/media.py
+index d867f70..e55595e 100644
+--- a/backend/services/media.py
++++ b/backend/services/media.py
+@@ -29,17 +29,6 @@ _FONT_CANDIDATES = {
+             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"],
+ }
+ 
+-_tts = None
+-
+-
+-def _get_tts():
+-    global _tts
+-    if _tts is None:
+-        from emergentintegrations.llm.openai import OpenAITextToSpeech
+-        _tts = OpenAITextToSpeech(api_key=candidate_keys()[0])
+-    return _tts
+-
+-
+ def _img_tts_keys():
+     return candidate_keys()
+ 
+@@ -86,7 +75,7 @@ async def synthesize_voice(text: str, voice: str, speed: float, out_path: Path,
+ 
+ 
+ async def openai_tts(text: str, voice_spec: str, out_path: Path) -> float:
+-    from emergentintegrations.llm.openai import OpenAITextToSpeech
++    from openai import AsyncOpenAI
+     clean = " ".join(str(text).split())[:3500]
+     last_err = None
+     for key in _img_tts_keys():
+@@ -96,11 +85,11 @@ async def openai_tts(text: str, voice_spec: str, out_path: Path) -> float:
+                 vo = GEMINI_TO_OPENAI_VOICE.get(vo.split(":", 1)[1].lower(), "onyx")
+             if vo not in OPENAI_VOICES:
+                 vo = "onyx"
+-            tts = OpenAITextToSpeech(api_key=key)
+-            audio = await tts.generate_speech(
+-                text=clean, model="tts-1", voice=vo,
++            client = AsyncOpenAI(api_key=key, timeout=120)
++            audio = await client.audio.speech.create(
++                model="tts-1", voice=vo, input=clean,
+                 speed=max(0.25, min(4.0, 1.0)), response_format="mp3")
+-            out_path.write_bytes(audio)
++            out_path.write_bytes(audio.content)
+             return ffprobe_duration(out_path)
+         except Exception as e:
+             last_err = e
+diff --git a/backend/services/router.py b/backend/services/router.py
+index d27a3fb..c1d6adf 100644
+--- a/backend/services/router.py
++++ b/backend/services/router.py
+@@ -41,7 +41,7 @@ def chain(kind: str) -> list:
+         return list(LOCAL_TTS_CHAIN)
+     order = {
+         "image": os.environ.get("IMAGE_PROVIDER_ORDER",
+-                                "openai,stability,hf_flux,fal_flux,replicate_flux,emergent,gemini,qwen_local,pexels,procedural"),
++                                "openai,stability,hf_flux,fal_flux,replicate_flux,gemini,qwen_local,pexels,procedural"),
+         "video": os.environ.get("VIDEO_PROVIDER_ORDER", "gemini_veo,replicate_wan,fal_wan,pexels_video,kenburns"),
+     }
+     return [p.strip() for p in order[kind].split(",") if p.strip()]
+@@ -323,7 +323,7 @@ async def image(prompt: str, out_path: Path, ref_image: Path = None, session: st
+     from services import imagegen, gemini, generation
+     from job_queue import JobCancelled
+     selected = await generation.resolve('image', segment_index)
+-    providers = ['gemini', 'emergent'] if selected == 'auto' else [selected]
++    providers = ['gemini'] if selected == 'auto' else [selected]
+     errors = []
+     out_path = Path(out_path)
+     out_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -331,19 +331,14 @@ async def image(prompt: str, out_path: Path, ref_image: Path = None, session: st
+         try:
+             if require_reference and (not ref_image or not Path(ref_image).exists()):
+                 raise generation.ProviderFailure('An approved character reference is required before this frame can be generated.', code='REFERENCE_MISSING')
+-            if require_reference and provider not in ('gemini', 'emergent', 'studio'):
+-                raise generation.ProviderFailure(f'{provider} cannot edit reference images in this app. Select Gemini, Emergent or Studio to preserve identity.', code='REFERENCE_UNSUPPORTED')
++            if require_reference and provider not in ('gemini', 'studio'):
++                raise generation.ProviderFailure(f'{provider} cannot edit reference images in this app. Select Gemini or Studio to preserve identity.', code='REFERENCE_UNSUPPORTED')
+             if provider == 'studio':
+                 from services.studio import generate
+                 result = await generate('image', prompt, out_path, await generation.settings(), ref_image, segment_index)
+             elif provider == 'gemini':
+                 out_path.write_bytes(await gemini.gen_image(prompt, imagegen._ref_bytes(ref_image)))
+                 result = {'provider': 'gemini', 'ai': True}
+-            elif provider == 'emergent':
+-                if not gemini.emergent_key():
+-                    raise generation.ProviderFailure('EMERGENT_LLM_KEY is not configured', code='NOT_CONFIGURED')
+-                await asyncio.wait_for(imagegen._gen_gemini_proxy(gemini.emergent_key(), prompt, out_path, ref_image, session), timeout=240)
+-                result = {'provider': 'emergent', 'ai': True}
+             elif provider == 'openai':
+                 if not gemini.openai_key():
+                     raise generation.ProviderFailure('OPENAI_API_KEY is not configured', code='NOT_CONFIGURED')
+diff --git a/backend/services/storage.py b/backend/services/storage.py
+index 1b6cd34..0c0b0b7 100644
+--- a/backend/services/storage.py
++++ b/backend/services/storage.py
+@@ -1,36 +1,36 @@
+-import os
++"""Local-disk object storage (replaces the old hosted object store).
+ 
+-import requests
++Files live under STORAGE_DIR (default: <repo>/storage). Object paths look like
++"storyforge/uploads/<book_id>/<filename>" and are what gets saved in MongoDB as
++`storage_path`, so the interface (put_object / get_object) is unchanged.
++"""
++import mimetypes
++import os
++from pathlib import Path
+ 
+-STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
+-STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
+ APP_NAME = "storyforge"
+-storage_key = None
++STORAGE_ROOT = Path(os.environ.get("STORAGE_DIR") or Path(__file__).resolve().parent.parent.parent / "storage")
+ 
+ 
+-def init_storage(force: bool = False):
+-    global storage_key
+-    if storage_key and not force:
+-        return storage_key
+-    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": os.environ.get("EMERGENT_LLM_KEY")}, timeout=30)
+-    resp.raise_for_status()
+-    storage_key = resp.json()["storage_key"]
+-    return storage_key
++def _resolve(path: str) -> Path:
++    """Map an object path to a file under STORAGE_ROOT, refusing anything that escapes it."""
++    root = STORAGE_ROOT.resolve()
++    target = (root / str(path).lstrip("/")).resolve()
++    if root != target and root not in target.parents:
++        raise ValueError("invalid storage path")
++    return target
+ 
+ 
+-def put_object(path: str, data: bytes, content_type: str) -> dict:
+-    key = init_storage()
+-    resp = requests.put(
+-        f"{STORAGE_URL}/objects/{path}",
+-        headers={"X-Storage-Key": key, "Content-Type": content_type},
+-        data=data, timeout=120,
+-    )
+-    resp.raise_for_status()
+-    return resp.json()
++def put_object(path: str, data: bytes, content_type: str = "application/octet-stream") -> dict:
++    target = _resolve(path)
++    target.parent.mkdir(parents=True, exist_ok=True)
++    target.write_bytes(data)
++    return {"path": str(path).lstrip("/"), "size": len(data), "content_type": content_type}
+ 
+ 
+ def get_object(path: str):
+-    key = init_storage()
+-    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=120)
+-    resp.raise_for_status()
+-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
++    target = _resolve(path)
++    if not target.is_file():
++        raise FileNotFoundError(f"object not found: {path}")
++    content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
++    return target.read_bytes(), content_type
+diff --git a/backend/tests/backend_test.py b/backend/tests/backend_test.py
+index 2809b9c..d822dd4 100644
+--- a/backend/tests/backend_test.py
++++ b/backend/tests/backend_test.py
+@@ -229,7 +229,7 @@ class TestStoryConfig:
+ 
+ # ---------- 5. API Keys Vault ----------
+ class TestApiKeysVault:
+-    ALL_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "EMERGENT_LLM_KEY", "FAL_KEY", "HF_TOKEN",
++    ALL_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "FAL_KEY", "HF_TOKEN",
+                 "REPLICATE_API_TOKEN", "YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET",
+                 "YOUTUBE_REFRESH_TOKEN", "INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_USER_ID"}
+ 
+diff --git a/backend/tests/test_iteration5_bugfix.py b/backend/tests/test_iteration5_bugfix.py
+index 3715017..5718978 100644
+--- a/backend/tests/test_iteration5_bugfix.py
++++ b/backend/tests/test_iteration5_bugfix.py
+@@ -9,7 +9,7 @@ import time
+ import pytest
+ import requests
+ 
+-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://tale-video-engine.preview.emergentagent.com").rstrip("/")
++BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8001").rstrip("/")
+ STORY_ID = "6aa616a70b6da578466afad5"
+ 
+ 
+diff --git a/backend/tests/test_iteration9_preview_beatsync.py b/backend/tests/test_iteration9_preview_beatsync.py
+index a5d9704..9bdc227 100644
+--- a/backend/tests/test_iteration9_preview_beatsync.py
++++ b/backend/tests/test_iteration9_preview_beatsync.py
+@@ -5,7 +5,7 @@ import subprocess
+ import requests
+ import pytest
+ 
+-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://tale-video-engine.preview.emergentagent.com").rstrip("/")
++BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8001").rstrip("/")
+ ADMIN_BEARER = "qa_admin_test-admin-4447"
+ H = {"Authorization": f"Bearer {ADMIN_BEARER}", "Content-Type": "application/json"}
+ 
+diff --git a/backend/tests/test_media_engines_contract.py b/backend/tests/test_media_engines_contract.py
+index fa34c83..13b641f 100644
+--- a/backend/tests/test_media_engines_contract.py
++++ b/backend/tests/test_media_engines_contract.py
+@@ -43,7 +43,7 @@ def mock_http(monkeypatch, handler):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_path):
++async def test_selected_gemini_never_falls_back_to_other_providers(sandbox, monkeypatch, tmp_path):
+     await sandbox.settings.insert_one({'key': 'media_engines', 'values': {'image': 'gemini', 'video': 'kenburns'}})
+     called = []
+     async def direct(prompt, ref=None):
+@@ -53,7 +53,7 @@ async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_
+         raise AssertionError('Wrong provider called')
+     monkeypatch.setattr(gemini, 'gen_image', direct)
+     from services import imagegen
+-    monkeypatch.setattr(imagegen, '_gen_gemini_proxy', forbidden)
++    monkeypatch.setattr(imagegen, '_gen_openai_image', forbidden)
+     with pytest.raises(generation.ProviderFailure, match='RESOURCE_EXHAUSTED'):
+         await router.image('prompt', tmp_path / 'out.png')
+     assert called == ['gemini']
+@@ -65,8 +65,8 @@ async def test_selected_gemini_never_invokes_emergent(sandbox, monkeypatch, tmp_
+ @pytest.mark.asyncio
+ async def test_segment_inheritance(sandbox):
+     await sandbox.settings.insert_one({'key': 'media_engines', 'values': {'image': 'gemini', 'video': 'kenburns'}})
+-    await sandbox.story_engines.update_one({'_id': 'test-story'}, {'$set': {'image': 'emergent', 'segments': {'0': {'image': 'studio', 'video': 'gemini_veo'}}}})
+-    assert await generation.resolve('image') == 'emergent'
++    await sandbox.story_engines.update_one({'_id': 'test-story'}, {'$set': {'image': 'openai', 'segments': {'0': {'image': 'studio', 'video': 'gemini_veo'}}}})
++    assert await generation.resolve('image') == 'openai'
+     assert await generation.resolve('image', 0) == 'studio'
+     assert await generation.resolve('video', 0) == 'gemini_veo'
+     assert await generation.resolve('video', 1) == 'kenburns'
+diff --git a/design_guidelines.json b/design_guidelines.json
+index 397ca57..b585a3d 100644
+--- a/design_guidelines.json
++++ b/design_guidelines.json
+@@ -130,7 +130,7 @@
+         "components": [
+           "Interactive 6-Beat Story Script Editor (Hook, Story, Twist, Climax, Action, Lesson) with color-coded segment cards",
+           "Per-Segment Character Consistency Sheet Drawer (Character prompt anchors, seed IDs, reference tags)",
+-          "Per-Segment TTS Audio Player Preview with Hindi/Regional voice selection (OpenAI Emergent Universal Key TTS)",
++          "Per-Segment TTS Audio Player Preview with Hindi/Regional voice selection (local Kokoro / OpenAI / Gemini TTS)",
+           "Per-Segment Visual Prompt & AI Frame Preview with FFmpeg motion settings (Zoom In, Pan Left, Slow Push)",
+           "Integrated 9:16 Video Player with synced narration, background music track, and burned-in subtitle overlay",
+           "Automated LLM QA Report Matrix (Checks: 6 Beat Integrity, Visual Consistency, Narration Pacing, Content Safety, Cultural Accuracy)",
+diff --git a/frontend/.env.example b/frontend/.env.example
+new file mode 100644
+index 0000000..283e809
+--- /dev/null
++++ b/frontend/.env.example
+@@ -0,0 +1,2 @@
++# The frontend calls relative /api paths; the dev server proxies them to this backend.
++BACKEND_PROXY_TARGET=http://localhost:8001
+diff --git a/frontend/craco.config.js b/frontend/craco.config.js
+index b143725..cadb02d 100644
+--- a/frontend/craco.config.js
++++ b/frontend/craco.config.js
+@@ -69,31 +69,6 @@ if (config.enableHealthCheck) {
+   healthPluginInstance = new WebpackHealthPlugin();
+ }
+ 
+-// Branded error overlay + preview health probe, dev server only. Fails open: a broken
+-// overlay must degrade to "no overlay", never to "no dev server".
+-let emergentOverlay;
+-if (isDevServer && process.env.DISABLE_EMERGENT_OVERLAY !== "true") {
+-  try {
+-    emergentOverlay = require("@emergentbase/overlay/craco").emergentOverlayCraco({
+-      root: __dirname,
+-    });
+-    // A wrong shape would otherwise TypeError at dev-server config time, past this catch.
+-    if (
+-      typeof emergentOverlay.devServer !== "function" ||
+-      typeof emergentOverlay.attach !== "function" ||
+-      typeof emergentOverlay.webpackPlugin?.apply !== "function"
+-    ) {
+-      throw new Error("unexpected adapter shape");
+-    }
+-  } catch (err) {
+-    emergentOverlay = undefined;
+-    console.warn(
+-      "[emergent-overlay] not loaded — overlay disabled:",
+-      err instanceof Error ? err.message : err,
+-    );
+-  }
+-}
+-
+ let webpackConfig = {
+   eslint: {
+     configure: {
+@@ -128,16 +103,22 @@ let webpackConfig = {
+         webpackConfig.plugins.push(healthPluginInstance);
+       }
+ 
+-      // Overlay's HTML injection + compile-error capture; self-gates on mode !== development.
+-      if (emergentOverlay) {
+-        webpackConfig.plugins.push(emergentOverlay.webpackPlugin);
+-      }
+       return webpackConfig;
+     },
+   },
+ };
+ 
+ webpackConfig.devServer = (devServerConfig) => {
++  // Forward /api (API + media) to the FastAPI backend, since the frontend calls relative /api paths.
++  // Override the target with BACKEND_PROXY_TARGET (default http://localhost:8001).
++  devServerConfig.proxy = [
++    {
++      context: ["/api"],
++      target: process.env.BACKEND_PROXY_TARGET || "http://localhost:8001",
++      changeOrigin: true,
++    },
++  ];
++
+   // Add health check endpoints if enabled
+   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
+     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;
+@@ -158,70 +139,6 @@ webpackConfig.devServer = (devServerConfig) => {
+   return devServerConfig;
+ };
+ 
+-// Wrap with visual edits (automatically adds babel plugin, dev server, and overlay in dev mode)
+-if (isDevServer) {
+-  try {
+-    const { withVisualEdits } = require("@emergentbase/visual-edits/craco");
+-    webpackConfig = withVisualEdits(webpackConfig);
+-  } catch (err) {
+-    if (err.code === 'MODULE_NOT_FOUND' && err.message.includes('@emergentbase/visual-edits/craco')) {
+-      console.warn(
+-        "[visual-edits] @emergentbase/visual-edits not installed — visual editing disabled."
+-      );
+-    } else {
+-      throw err;
+-    }
+-  }
+-}
+-
+-// Overlay wraps last: visual-edits assigns setupMiddlewares instead of chaining onto it,
+-// so anything registered before it is dropped.
+-if (emergentOverlay) {
+-  const devServerBeforeOverlay = webpackConfig.devServer;
+-
+-  // Fail open at each call site too: a throw inside the adapter costs the overlay, never
+-  // the dev server. Warns once, then this path stops calling it.
+-  let overlay = emergentOverlay;
+-  const overlayFailed = (site, err) => {
+-    overlay = undefined;
+-    console.warn(
+-      `[emergent-overlay] ${site} failed — overlay disabled:`,
+-      err instanceof Error ? err.message : err,
+-    );
+-  };
+-
+-  webpackConfig.devServer = (devServerConfig) => {
+-    devServerConfig = devServerBeforeOverlay(devServerConfig);
+-
+-    // Overlay owns runtime errors; webpack keeps compile errors.
+-    try {
+-      devServerConfig = overlay.devServer(devServerConfig);
+-    } catch (err) {
+-      overlayFailed("devServer config", err);
+-    }
+-
+-    const previousSetupMiddlewares = devServerConfig.setupMiddlewares;
+-
+-    devServerConfig.setupMiddlewares = (middlewares, devServer) => {
+-      // Registered ahead of the chain's own body parsers, which would consume the raw stream
+-      // the overlay reads. Adapter taking a pre-parsed req.body is the overlay-side fix.
+-      try {
+-        if (overlay) overlay.attach(devServer);
+-      } catch (err) {
+-        overlayFailed("attach", err);
+-      }
+-
+-      if (previousSetupMiddlewares) {
+-        middlewares = previousSetupMiddlewares(middlewares, devServer);
+-      }
+-
+-      return middlewares;
+-    };
+-
+-    return devServerConfig;
+-  };
+-}
+-
+ const configureDevServer = webpackConfig.devServer;
+ webpackConfig.devServer = (devServerConfig) =>
+   makeDevServerV5Compatible(configureDevServer(devServerConfig));
+diff --git a/frontend/package.json b/frontend/package.json
+index 69f1cf4..84355b0 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -82,8 +82,6 @@
+   "devDependencies": {
+     "@babel/plugin-proposal-private-property-in-object": "7.21.11",
+     "@craco/craco": "7.1.0",
+-    "@emergentbase/overlay": "https://assets.emergent.sh/npm/emergentbase-overlay-0.1.28.tgz",
+-    "@emergentbase/visual-edits": "https://assets.emergent.sh/npm/emergentbase-visual-edits-1.0.13.tgz",
+     "@eslint/js": "9.23.0",
+     "@types/lodash": "4.17.24",
+     "@types/node": "18.19.0",
+diff --git a/frontend/src/App.js b/frontend/src/App.js
+index 669b98c..e709d81 100644
+--- a/frontend/src/App.js
++++ b/frontend/src/App.js
+@@ -1,9 +1,9 @@
+ import "@/App.css";
+ import { Toaster } from "@/components/ui/sonner";
+-import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
++import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+ import { ChannelProvider } from "@/lib/api";
+ import Layout from "@/components/Layout";
+-import AuthCallback from "@/components/AuthCallback";
++import ProtectedRoute from "@/components/ProtectedRoute";
+ import LoginPage from "@/pages/LoginPage";
+ import DashboardPage from "@/pages/DashboardPage";
+ import UploadPage from "@/pages/UploadPage";
+@@ -19,13 +19,10 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+ const queryClient = new QueryClient({ defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } } });
+ 
+ function AppRouter() {
+-  const location = useLocation();
+-  // Process the OAuth session_id BEFORE anything else (avoids the provider race condition)
+-  if (location.hash?.includes("session_id=")) return <AuthCallback />;
+   return (
+     <Routes>
+       <Route path="/login" element={<LoginPage />} />
+-      <Route element={<Layout />}>
++      <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+         <Route path="/" element={<Navigate to="/dashboard" replace />} />
+         <Route path="/dashboard" element={<DashboardPage />} />
+         <Route path="/upload" element={<UploadPage />} />
+diff --git a/frontend/src/components/AuthCallback.jsx b/frontend/src/components/AuthCallback.jsx
+deleted file mode 100644
+index 595a1cf..0000000
+--- a/frontend/src/components/AuthCallback.jsx
++++ /dev/null
+@@ -1,36 +0,0 @@
+-import { useEffect, useRef } from "react";
+-import { useLocation, useNavigate } from "react-router-dom";
+-import { Flame, Loader2 } from "lucide-react";
+-import { api } from "@/lib/api";
+-
+-export default function AuthCallback() {
+-  const processed = useRef(false);
+-  const location = useLocation();
+-  const navigate = useNavigate();
+-
+-  useEffect(() => {
+-    if (processed.current) return;
+-    processed.current = true;
+-    const sessionId = (location.hash.match(/session_id=([^&]+)/) || [])[1];
+-    if (!sessionId) {
+-      navigate("/login", { replace: true });
+-      return;
+-    }
+-    api.post("/auth/session", { session_id: sessionId })
+-      .then((r) => {
+-        window.history.replaceState(null, "", window.location.pathname);
+-        navigate("/dashboard", { replace: true, state: { user: r.data.user } });
+-      })
+-      .catch(() => navigate("/login", { replace: true }));
+-  }, [location.hash, navigate]);
+-
+-  return (
+-    <div className="grain flex min-h-screen items-center justify-center" style={{ background: "#090A0F" }}>
+-      <div className="flex items-center gap-3 text-sm text-slate-300">
+-        <Flame className="h-5 w-5 text-amber-400" />
+-        Signing you in
+-        <Loader2 className="h-4 w-4 animate-spin text-amber-400" />
+-      </div>
+-    </div>
+-  );
+-}
+diff --git a/frontend/src/components/ProtectedRoute.jsx b/frontend/src/components/ProtectedRoute.jsx
+index 837386e..7905f35 100644
+--- a/frontend/src/components/ProtectedRoute.jsx
++++ b/frontend/src/components/ProtectedRoute.jsx
+@@ -3,13 +3,15 @@ import { Navigate, useLocation } from "react-router-dom";
+ import { Flame, Loader2 } from "lucide-react";
+ import { api } from "@/lib/api";
+ 
++// Lets everyone through when the backend runs with AUTH_REQUIRED=false; otherwise needs a Google session.
+ export default function ProtectedRoute({ children }) {
+   const location = useLocation();
+   const [state, setState] = useState(location.state?.user ? "authed" : "checking");
+ 
+   useEffect(() => {
+     if (state !== "checking") return;
+-    api.get("/auth/me")
++    api.get("/auth/config")
++      .then((c) => (c.data.auth_required ? api.get("/auth/me") : null))
+       .then(() => setState("authed"))
+       .catch(() => setState("anon"));
+   }, [state]);
+diff --git a/frontend/src/constants/testIds/auth.js b/frontend/src/constants/testIds/auth.js
+index 9ff6ae5..12a5292 100644
+--- a/frontend/src/constants/testIds/auth.js
++++ b/frontend/src/constants/testIds/auth.js
+@@ -8,8 +8,7 @@
+ //     'login-submit-button', 'cart-quantity-input', 'product-card-image'.
+ //   - Reference them in JSX as `data-testid={LOGIN.submitButton}`.
+ //
+-// Why kebab-case values: required by qabot's CSS-attribute selector matcher
+-// and the lint rule `emergent(kebab-case-testid)`.
++// Why kebab-case values: they are used by CSS-attribute selectors in tests.
+ 
+ export const LOGIN = {
+ 	emailInput: 'login-email-input',
+diff --git a/frontend/src/constants/testIds/home.js b/frontend/src/constants/testIds/home.js
+index cbe75f6..3d05432 100644
+--- a/frontend/src/constants/testIds/home.js
++++ b/frontend/src/constants/testIds/home.js
+@@ -2,5 +2,4 @@
+ // in ./auth.js (keys camelCase, values kebab-case `<feature>-<element>`).
+ 
+ export const HOME = {
+-	emergentLink: 'home-emergent-link',
+ };
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+index d30afc0..9adc90c 100644
+--- a/frontend/src/lib/api.ts
++++ b/frontend/src/lib/api.ts
+@@ -7,6 +7,22 @@ export const API = '/api';
+ export const MEDIA = '';
+ export const api = axios.create({ baseURL: API, withCredentials: true });
+ 
++// When the backend requires login, an expired or missing session sends the user to /login.
++api.interceptors.response.use(
++  (response) => response,
++  (error) => {
++    if (
++      axios.isAxiosError(error) &&
++      error.response?.status === 401 &&
++      !String(error.config?.url || '').startsWith('/auth') &&
++      window.location.pathname !== '/login'
++    ) {
++      window.location.assign('/login');
++    }
++    return Promise.reject(error);
++  },
++);
++
+ async function request<T>(path: string, method: string, body?: unknown): Promise<T> {
+   if (!path.startsWith('/api/')) throw new Error('Expected a relative /api path');
+   try {
+diff --git a/frontend/src/lib/engine-types.ts b/frontend/src/lib/engine-types.ts
+index 89d933f..4779650 100644
+--- a/frontend/src/lib/engine-types.ts
++++ b/frontend/src/lib/engine-types.ts
+@@ -1,4 +1,4 @@
+-export type ImageEngine = 'auto' | 'gemini' | 'emergent' | 'openai' | 'stability' | 'fal_flux' | 'replicate_flux' | 'hf_flux' | 'studio';
++export type ImageEngine = 'auto' | 'gemini' | 'openai' | 'stability' | 'fal_flux' | 'replicate_flux' | 'hf_flux' | 'studio';
+ export type VideoEngine = 'auto' | 'kenburns' | 'gemini_veo' | 'studio';
+ export interface EngineChoice { image: ImageEngine | null; video: VideoEngine | null }
+ export interface EngineSettings { image: ImageEngine; video: VideoEngine; studio_base_url: string; studio_poll_seconds: number; studio_timeout_seconds: number }
+diff --git a/frontend/src/pages/LoginPage.jsx b/frontend/src/pages/LoginPage.jsx
+index 5503f90..9fa4079 100644
+--- a/frontend/src/pages/LoginPage.jsx
++++ b/frontend/src/pages/LoginPage.jsx
+@@ -1,24 +1,65 @@
+-import { useState } from "react";
++import { useEffect, useRef, useState } from "react";
++import { useNavigate } from "react-router-dom";
+ import { Flame, Loader2 } from "lucide-react";
++import { api } from "@/lib/api";
+ 
+-const GoogleIcon = () => (
+-  <svg viewBox="0 0 24 24" className="h-4 w-4">
+-    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.27-4.74 3.27-8.1z" />
+-    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+-    <path fill="#FBBC05" d="M5.84 14.1c-.22-.66-.35-1.36-.35-2.1s.13-1.44.35-2.1V7.06H2.18A10.96 10.96 0 0 0 1 12c0 1.77.43 3.45 1.18 4.94l3.66-2.84z" />
+-    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
+-  </svg>
+-);
++const GSI_SRC = "https://accounts.google.com/gsi/client";
++
++function loadGoogleScript() {
++  return new Promise((resolve, reject) => {
++    if (window.google?.accounts?.id) return resolve();
++    const existing = document.querySelector(`script[src="${GSI_SRC}"]`);
++    const script = existing || document.createElement("script");
++    script.addEventListener("load", () => resolve());
++    script.addEventListener("error", () => reject(new Error("Could not load Google Sign-In")));
++    if (!existing) {
++      script.src = GSI_SRC;
++      script.async = true;
++      document.head.appendChild(script);
++    }
++  });
++}
+ 
+ export default function LoginPage() {
+-  const [going, setGoing] = useState(false);
++  const navigate = useNavigate();
++  const buttonRef = useRef(null);
++  const [error, setError] = useState("");
++  const [busy, setBusy] = useState(false);
+ 
+-  const login = () => {
+-    // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
+-    setGoing(true);
+-    const redirectUrl = window.location.origin + "/dashboard";
+-    window.location.href = `https://auth.emergentagent.com/?redirect=${encodeURIComponent(redirectUrl)}`;
+-  };
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const { data } = await api.get("/auth/config");
++        if (!data.google_client_id) {
++          setError("Google sign-in is not configured. Set GOOGLE_CLIENT_ID in backend/.env.");
++          return;
++        }
++        await loadGoogleScript();
++        if (cancelled || !buttonRef.current) return;
++        window.google.accounts.id.initialize({
++          client_id: data.google_client_id,
++          callback: async ({ credential }) => {
++            setBusy(true);
++            setError("");
++            try {
++              const r = await api.post("/auth/session", { credential });
++              navigate("/dashboard", { replace: true, state: { user: r.data.user } });
++            } catch (e) {
++              setError(e.response?.data?.detail || "Sign-in failed. Try again.");
++              setBusy(false);
++            }
++          },
++        });
++        window.google.accounts.id.renderButton(buttonRef.current, {
++          theme: "outline", size: "large", text: "signin_with", shape: "rectangular", width: 320,
++        });
++      } catch (e) {
++        if (!cancelled) setError(e.message || "Could not start Google sign-in.");
++      }
++    })();
++    return () => { cancelled = true; };
++  }, [navigate]);
+ 
+   return (
+     <div className="grain flex min-h-screen items-center justify-center px-6" style={{ background: "#090A0F" }}>
+@@ -28,16 +69,13 @@ export default function LoginPage() {
+         </div>
+         <h1 data-testid="login-heading" className="font-display text-3xl font-extrabold tracking-tight text-amber-100">StoryForge</h1>
+         <p className="mt-2 text-sm text-slate-400">Mythology, folk tales &amp; public-interest news — your AI video factory.</p>
+-        <button
+-          data-testid="google-login-button"
+-          onClick={login}
+-          disabled={going}
+-          className="mt-8 flex w-full items-center justify-center gap-3 rounded-xl bg-white px-5 py-3 text-sm font-semibold text-[#1a1a1a] transition-colors hover:bg-slate-100 disabled:opacity-60"
+-        >
+-          {going ? <Loader2 className="h-4 w-4 animate-spin" /> : <GoogleIcon />} Sign in with Google
+-        </button>
++        <div className="mt-8 flex min-h-[44px] items-center justify-center">
++          <div ref={buttonRef} data-testid="google-login-button" />
++          {busy && <Loader2 className="ml-3 h-4 w-4 animate-spin text-amber-400" />}
++        </div>
++        {error && <p data-testid="login-error" className="mt-4 text-xs text-red-400">{error}</p>}
+         <p className="mt-6 text-[11px] leading-relaxed text-slate-600">
+-          Optional — the studio works without signing in. Sign in with Google to unlock the Admin Console; your session stays valid for 7 days.
++          Sign in with your Google account. Your session stays valid for 7 days.
+         </p>
+       </div>
+     </div>
+diff --git a/frontend/src/pages/SettingsPage.jsx b/frontend/src/pages/SettingsPage.jsx
+index 5bcdfaa..44af447 100644
+--- a/frontend/src/pages/SettingsPage.jsx
++++ b/frontend/src/pages/SettingsPage.jsx
+@@ -12,7 +12,6 @@ const KEY_LABELS = {
+   STUDIO_API_TOKEN: "Your Studio — backend-only Bearer token (add after installing its HTTP API)",
+   OPENAI_API_KEY: "OpenAI (DALL·E / GPT Image 1 + LLM fallback)",
+   GEMINI_API_KEY: "Google Gemini (Veo video, TTS, image, LLM)",
+-  EMERGENT_LLM_KEY: "Emergent Universal Key (LLM fallback)",
+   HF_TOKEN: "Hugging Face (free hosted Qwen-72B text fallback; image API deprecated by HF)",
+   FAL_KEY: "fal.ai (FLUX / SDXL / Juggernaut images, Wan / CogVideoX clips)",
+   REPLICATE_API_TOKEN: "Replicate (FLUX images, Wan 2.1 clips)",

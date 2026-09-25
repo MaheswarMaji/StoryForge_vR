@@ -1,4 +1,5 @@
-"""Adapter for the proposed Studio contract; no remote service is assumed to exist."""
+"""Studio adapters. Default: the local batch.py worker (services/studio_local.py).
+The HTTP client below is only used if a Studio base URL is saved (legacy/proposed contract)."""
 import asyncio
 import hashlib
 import json
@@ -69,6 +70,12 @@ async def _reference(studio, ref_image):
 
 
 async def generate(kind, prompt, out_path, config, ref_image=None, segment=None, duration=6):
+    if not config.studio_base_url:
+        if kind != 'image':
+            raise ProviderFailure('The Studio worker only generates still images; video is not exposed. Use Ken Burns or another video engine.',
+                                  code='UNSUPPORTED_OPERATION')
+        from services import studio_local
+        return await studio_local.generate_image(prompt, out_path, config, segment)
     ctx = generation_context.get()
     story_id = ctx.get('story_id', '')
     story = await db.stories.find_one({'_id': story_id}) or {}

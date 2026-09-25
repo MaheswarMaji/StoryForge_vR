@@ -7,6 +7,22 @@ export const API = '/api';
 export const MEDIA = '';
 export const api = axios.create({ baseURL: API, withCredentials: true });
 
+// When the backend requires login, an expired or missing session sends the user to /login.
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (
+      axios.isAxiosError(error) &&
+      error.response?.status === 401 &&
+      !String(error.config?.url || '').startsWith('/auth') &&
+      window.location.pathname !== '/login'
+    ) {
+      window.location.assign('/login');
+    }
+    return Promise.reject(error);
+  },
+);
+
 async function request<T>(path: string, method: string, body?: unknown): Promise<T> {
   if (!path.startsWith('/api/')) throw new Error('Expected a relative /api path');
   try {

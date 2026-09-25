@@ -3,13 +3,15 @@ import { Navigate, useLocation } from "react-router-dom";
 import { Flame, Loader2 } from "lucide-react";
 import { api } from "@/lib/api";
 
+// Lets everyone through when the backend runs with AUTH_REQUIRED=false; otherwise needs a Google session.
 export default function ProtectedRoute({ children }) {
   const location = useLocation();
   const [state, setState] = useState(location.state?.user ? "authed" : "checking");
 
   useEffect(() => {
     if (state !== "checking") return;
-    api.get("/auth/me")
+    api.get("/auth/config")
+      .then((c) => (c.data.auth_required ? api.get("/auth/me") : null))
       .then(() => setState("authed"))
       .catch(() => setState("anon"));
   }, [state]);

@@ -1,10 +1,11 @@
 import asyncio
 import logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, APIRouter
+from fastapi import Depends, FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -12,13 +13,13 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from db import db
 from routes import router
-from auth import auth_router
+from auth import auth_router, verify_auth
 from admin import admin_router
 from services.ocr import MEDIA_ROOT
 import job_queue
 import tasks as tasks_mod
 
-app = FastAPI(title="StoryForge API", version="1.0")
+app = FastAPI(title="StoryForge API", version="1.0", dependencies=[Depends(verify_auth)])
 
 app.add_middleware(
     CORSMiddleware,

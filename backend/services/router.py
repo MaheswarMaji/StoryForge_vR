@@ -41,7 +41,7 @@ def chain(kind: str) -> list:
         return list(LOCAL_TTS_CHAIN)
     order = {
         "image": os.environ.get("IMAGE_PROVIDER_ORDER",
-                                "openai,stability,hf_flux,fal_flux,replicate_flux,emergent,gemini,qwen_local,pexels,procedural"),
+                                "openai,stability,hf_flux,fal_flux,replicate_flux,gemini,qwen_local,pexels,procedural"),
         "video": os.environ.get("VIDEO_PROVIDER_ORDER", "gemini_veo,replicate_wan,fal_wan,pexels_video,kenburns"),
     }
     return [p.strip() for p in order[kind].split(",") if p.strip()]
@@ -323,7 +323,7 @@ async def image(prompt: str, out_path: Path, ref_image: Path = None, session: st
     from services import imagegen, gemini, generation
     from job_queue import JobCancelled
     selected = await generation.resolve('image', segment_index)
-    providers = ['gemini', 'emergent'] if selected == 'auto' else [selected]
+    providers = ['gemini'] if selected == 'auto' else [selected]
     errors = []
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,19 +331,14 @@ async def image(prompt: str, out_path: Path, ref_image: Path = None, session: st
         try:
             if require_reference and (not ref_image or not Path(ref_image).exists()):
                 raise generation.ProviderFailure('An approved character reference is required before this frame can be generated.', code='REFERENCE_MISSING')
-            if require_reference and provider not in ('gemini', 'emergent', 'studio'):
-                raise generation.ProviderFailure(f'{provider} cannot edit reference images in this app. Select Gemini, Emergent or Studio to preserve identity.', code='REFERENCE_UNSUPPORTED')
+            if require_reference and provider not in ('gemini', 'studio'):
+                raise generation.ProviderFailure(f'{provider} cannot edit reference images in this app. Select Gemini or Studio to preserve identity.', code='REFERENCE_UNSUPPORTED')
             if provider == 'studio':
                 from services.studio import generate
                 result = await generate('image', prompt, out_path, await generation.settings(), ref_image, segment_index)
             elif provider == 'gemini':
                 out_path.write_bytes(await gemini.gen_image(prompt, imagegen._ref_bytes(ref_image)))
                 result = {'provider': 'gemini', 'ai': True}
-            elif provider == 'emergent':
-                if not gemini.emergent_key():
-                    raise generation.ProviderFailure('EMERGENT_LLM_KEY is not configured', code='NOT_CONFIGURED')
-                await asyncio.wait_for(imagegen._gen_gemini_proxy(gemini.emergent_key(), prompt, out_path, ref_image, session), timeout=240)
-                result = {'provider': 'emergent', 'ai': True}
             elif provider == 'openai':
                 if not gemini.openai_key():
                     raise generation.ProviderFailure('OPENAI_API_KEY is not configured', code='NOT_CONFIGURED')
