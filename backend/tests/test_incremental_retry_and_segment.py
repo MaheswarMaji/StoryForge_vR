@@ -153,5 +153,47 @@ def test_ollama_payload_is_cpu_only(monkeypatch):
     assert captured["payload"]["model"] == "deepseek-r1:32b"
 
 
+# ── 4. Devanagari captions + timeline fit ──────────────────────────────────────
+
+def test_devanagari_font_is_not_bitmap_default(tmp_path):
+    """Hindi text must resolve to a real Indic TTF (with RAQM shaping), never the
+    bitmap load_default() which renders 'boxes'."""
+    from services import media
+
+    f = media.font_for_text("एक छोटे से गाँव में अर्जुन", 52)
+    assert getattr(f, "path", None), "Devanagari fell back to bitmap default (boxes bug)"
+    assert "devanagari" in f.path.lower() or media._fc_match("hi")
+    # PNG caption must render non-empty
+    out = tmp_path / "cap.png"
+    media.render_caption("घायल पक्षी को बचाया। नदी बहने लगी।", out)
+    assert out.stat().st_size > 2000
+
+
+def test_fit_audio_to_budget_speeds_up_over_budget(tmp_path):
+    import subprocess
+    from services import media
+
+    src = tmp_path / "t.mp3"
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=300:duration=6",
+                    "-c:a", "libmp3lame", str(src)], capture_output=True)
+    before = media.ffprobe_duration(src)
+    after = asyncio.get_event_loop().run_until_complete(
+        media.fit_audio_to_budget(src, 3.0))
+    assert before > 5.5
+    assert after < before - 0.8, "over-budget narration was not sped up"
+    assert after >= 4.0, "must not exceed the 1.35x natural-speed cap (would be ~4.4s)"
+
+
+def test_fit_audio_leaves_under_budget_untouched(tmp_path):
+    import subprocess
+    from services import media
+
+    src = tmp_path / "s.mp3"
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=300:duration=3",
+                    "-c:a", "libmp3lame", str(src)], capture_output=True)
+    dur = asyncio.get_event_loop().run_until_complete(media.fit_audio_to_budget(src, 9.0))
+    assert 2.7 <= dur <= 3.3, "under-budget audio must be left unchanged"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

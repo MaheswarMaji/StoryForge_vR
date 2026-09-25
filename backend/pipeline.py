@@ -154,6 +154,9 @@ async def _render_segment(ctx, i, chunk, audio_urls, frame_urls, sem, setp, job_
                           f"{chunk.get('pace') or 'medium'} pace",
                 expressive=channel.get("expressive_voice", True))
             await _save_cost(aid, "tts", media.tts_cost(chunk.get("voiceover", "")))
+            budget = ctx.get("seg_budget", 0.0)
+            if budget:  # gently speed narration so the video hits its target length
+                adur = await media.fit_audio_to_budget(aud, budget)
         dur = max(6.0, min(16.0, adur + 0.6))
 
         frame = MEDIA_ROOT / "frames" / aid / f"{i:02d}.png"
@@ -353,7 +356,9 @@ async def produce_video(story_id: str, setp, job_id=""):
 
     ctx = {"story_id": story_id, "story": story, "channel": channel, "chunks": chunks,
            "mode": mode, "style": style, "anchor": anchor, "char_path": char_path,
-           "editor": editor}
+           "editor": editor,
+           "seg_budget": max(4.0, (max(30, min(240, int(story.get("target_seconds") or 90))) - 3.2)
+                             / max(len(chunks), 1))}
     if job_id and is_cancelled(job_id):
         raise JobCancelled()
     if mode == "storyboard":

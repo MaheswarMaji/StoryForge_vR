@@ -8,7 +8,7 @@ import wave
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 from services import gemini
 from services.ocr import MEDIA_ROOT
@@ -21,12 +21,43 @@ IMAGE_PRICE = 0.03
 
 _FONT_CANDIDATES = {
     "dev": ["/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Bold.ttf"],
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansDevanagari-Bold.ttf",
+            "/usr/local/share/fonts/NotoSansDevanagari-Bold.ttf"],
     "ben": ["/usr/share/fonts/truetype/noto/NotoSansBengali-Bold.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansBengaliUI-Bold.ttf"],
+            "/usr/share/fonts/truetype/noto/NotoSansBengaliUI-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansBengali-Bold.ttf"],
     "lat": ["/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"],
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
 }
+
+# Complex scripts (Devanagari/Bengali) need HarfBuzz shaping — force RAQM when Pillow
+# was built with it; the BASIC engine renders matras/conjuncts as broken glyphs ("boxes").
+_RAQM = features.check("raqm")
+_LAYOUT = ImageFont.Layout.RAQM if _RAQM else ImageFont.Layout.BASIC
+_FC_LANG = {"dev": "hi", "ben": "bn", "lat": "en"}
+_FC_CACHE: dict = {}
+
+
+def _fc_match(lang: str) -> str:
+    """Locate a font for a language via fontconfig — portable across distros/paths."""
+    if lang in _FC_CACHE:
+        return _FC_CACHE[lang]
+    path = ""
+    try:
+        out = subprocess.run(["fc-match", "-f", "%{file}", f":lang={lang}"],
+                             capture_output=True, text=True, timeout=5)
+        cand = out.stdout.strip()
+        if cand and Path(cand).exists():
+            path = cand
+    except Exception:
+        path = ""
+    _FC_CACHE[lang] = path
+    return path
+
 
 def _img_tts_keys():
     from services.llm import candidate_keys
@@ -35,14 +66,26 @@ def _img_tts_keys():
 
 def font_for_text(text: str, size: int) -> ImageFont.FreeTypeFont:
     if any("\u0900" <= c <= "\u097F" for c in text):
-        cands = _FONT_CANDIDATES["dev"]
+        kind = "dev"
     elif any("\u0980" <= c <= "\u09FF" for c in text):
-        cands = _FONT_CANDIDATES["ben"]
+        kind = "ben"
     else:
-        cands = _FONT_CANDIDATES["lat"]
-    for p in cands:
+        kind = "lat"
+    for p in _FONT_CANDIDATES[kind]:
         if Path(p).exists():
-            return ImageFont.truetype(p, size)
+            return ImageFont.truetype(p, size, layout_engine=_LAYOUT)
+    # Portable fallback: ask fontconfig for a font that covers this language.
+    fc = _fc_match(_FC_LANG[kind])
+    if fc:
+        return ImageFont.truetype(fc, size, layout_engine=_LAYOUT)
+    if kind != "lat":
+        # Indic text with load_default() renders as boxes — surface the missing dependency.
+        print(f"[media] WARNING: no {kind} font found (raqm={_RAQM}); "
+              "install fonts-noto + a raqm-enabled Pillow to render Hindi/Bengali captions.",
+              flush=True)
+        for p in _FONT_CANDIDATES["lat"]:
+            if Path(p).exists():
+                return ImageFont.truetype(p, size, layout_engine=_LAYOUT)
     return ImageFont.load_default()
 
 
@@ -143,6 +186,38 @@ async def compose_ai_clip(ai_video: Path, narration: Path, caption: Path, out: P
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg ai-clip failed: {err.decode()[-600:]}")
     os.replace(str(out) + ".tmp.mp4", str(out))
+
+
+async def fit_audio_to_budget(src: Path, budget: float, max_tempo: float = 1.35) -> float:
+    """Gently speed up narration (in place) so a segment fits its time budget.
+
+    Only speeds UP (never slows), capped at max_tempo so the voice stays natural.
+    Returns the resulting duration. Keeps total video length close to the target
+    instead of overrunning (the 60s→78s drift).
+    """
+    cur = ffprobe_duration(src)
+    if budget <= 0 or cur <= budget + 0.35:
+        return cur
+    tempo = min(max_tempo, cur / budget)
+    if tempo <= 1.01:
+        return cur
+    tmp = Path(f"{src}.fit{src.suffix or '.mp3'}")
+    codec = ["-c:a", "libmp3lame", "-q:a", "2"] if src.suffix == ".mp3" else ["-c:a", "pcm_s16le"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(src), "-af", f"atempo={tempo:.3f}",
+            "-ar", "44100", "-ac", "2", *codec, str(tmp),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"[media] fit_audio skipped: {err.decode()[-140:]}", flush=True)
+            tmp.unlink(missing_ok=True)
+            return cur
+        os.replace(tmp, src)
+        return ffprobe_duration(src)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return cur
 
 
 def ffprobe_duration(path: Path) -> float:

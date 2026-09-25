@@ -262,6 +262,16 @@ function SegmentRow({ chunk, i, media, editing, drafts, setDraft, regen, busy, s
           <span className="rounded-full bg-black/30 px-3 py-1 text-[11px] text-slate-300">{chunk.emotion}</span>
         </span>
       </div>
+      {Array.isArray(chunk.cast) && (
+        <div data-testid={`segment-cast-${i}`} className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+          <span className="text-slate-500">Visible cast:</span>
+          {chunk.cast.length === 0 ? (
+            <span className="rounded-full bg-black/30 px-2.5 py-0.5 text-slate-400">Environment only</span>
+          ) : chunk.cast.map((c, k) => (
+            <span key={`cast-${i}-${k}`} className="rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 px-2.5 py-0.5 text-fuchsia-200">{c}</span>
+          ))}
+        </div>
+      )}
       <StoryEngineControls storyId={storyId} segment={i} disabled={busy} />
       <div className="mt-4 grid gap-5 lg:grid-cols-5">
         <div className="lg:col-span-3">
