@@ -1,0 +1,42 @@
+{
+  "summary": "Iteration 14 — verified Devanagari/Bengali font fix, fit_audio_to_budget behavior, and Story Studio cast display. Created new pytest file with 7 focused tests; all pass. Regression suite (test_incremental_retry_and_segment.py, 7 tests) still green. Combined 13/13 backend tests passed. Frontend seeded story /stories/6ab5f14152ebe8f78807faf9 renders character sheet and per-segment 'Visible cast:' chips exactly as specified.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration14_devanagari_and_fit.py",
+    "/app/backend/tests/test_incremental_retry_and_segment.py",
+    "/app/test_reports/pytest/iteration_14.xml"
+  ],
+  "verifications": {
+    "font_fix": {
+      "devanagari_font_path": "resolved to real Noto Devanagari TTF (font.path set, file exists)",
+      "bengali_font_path": "resolved to real Bengali TTF (font.path set, file exists)",
+      "raqm_enabled": true,
+      "layout_engine": "RAQM (1) for Indic text — matras/conjuncts shape correctly",
+      "render_caption_png": "PNG written for 'घायल पक्षी को बचाया। नदी बहने लगी।' (>2KB, not blank)"
+    },
+    "audio_fit": {
+      "over_budget": "6.0s → ~4.44s at budget=3.0 (speeds up, capped at 1.35x → new_dur < orig-0.8 and >= 4.0)",
+      "under_budget": "3.0s at budget=9.0 remains ~3.0s (untouched)"
+    },
+    "story_studio_cast_ui": {
+      "character-sheet-anchor": "present with text 'arjun: five-year-old Indian boy, saffron kurta, tousled black hair. Style: Indian miniature painting, warm palette.'",
+      "segment-cast-0": "'Visible cast:arjun' (fuchsia chip visible in screenshot)",
+      "segment-cast-1": "'Visible cast:arjun' (fuchsia chip visible in screenshot)",
+      "segment-cast-2": "'Visible cast:Environment only' (empty-cast fallback)"
+    }
+  },
+  "action_items": [],
+  "critical_code_review_comments": [
+    "font_for_text() has a well-designed 3-tier fallback (hard-coded Noto paths → fc-match by lang → Latin fallback with WARN), avoiding load_default() for Indic scripts. Good.",
+    "fit_audio_to_budget() correctly only speeds UP (never slows), caps at 1.35x tempo for naturalness, and no-ops when cur <= budget+0.35. Errors are logged and non-fatal (returns original duration).",
+    "backend/services/media.py is 651 lines — still within acceptable range but approaching the 700-line split threshold; consider extracting audio helpers if it grows further."
+  ],
+  "updated_files": ["/app/backend/tests/test_iteration14_devanagari_and_fit.py"],
+  "success_rate": {"backend": "100% (13/13)", "frontend": "100% (all cast/sheet data-testids resolve)"},
+  "test_credentials": "AUTH_REQUIRED=false — no login needed",
+  "seed_data_creation": "Used seeded story 6ab5f14152ebe8f78807faf9 ('Arjun and the Bird'); no new seed data created. Test audio mp3s generated in tmp via ffmpeg inside pytest.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Devanagari/Bengali font fix, RAQM shaping, and fit_audio_to_budget behavior are covered by test_iteration14_devanagari_and_fit.py. Story Studio cast chips render correctly on the seeded story. Ollama-dependent flows (produce/script/script_segment) still cannot be exercised here — that is expected. If future iterations touch media.py or the SegmentRow cast rendering, rerun iteration_14 tests + the existing test_incremental_retry_and_segment.py regression."
+}
