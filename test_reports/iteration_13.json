@@ -1,0 +1,18 @@
+{
+  "summary": "Verified new 'Segment my script' Create tab and incremental produce wiring per briefing. Backend API path with create_mode='segment' returns segmented=true with valid story_id/job_id; regression path (structured 'सीन 1/Scene 1' script without create_mode) returns imported=true with imported_segments=2. Frontend Create page shows all three tabs with expected data-testids; clicking create-tab-segment reveals the textarea, three mode radios, length slider and submit button. Submitting the segment form successfully created a story, showed a success toast ('Segmenting your script on the local CPU model — character sheet, cast, narration & visuals are being built'), and navigated to /stories/<id> which rendered in 'Scripting' stage with 'Pasted script — LLM segmented' source label as expected. Ollama unreachability is out of scope and not observed here (job just enqueued).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_incremental_retry_and_segment.py (pre-existing, already passing per briefing)"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "None required — AUTH_REQUIRED=false",
+  "seed_data_creation": "Two test stories created via curl (TEST_QA_seg -> 6ab5eee9b56e864cc7e907d7, TEST_QA_verbatim -> 6ab5eef0b56e864cc7e907da) and one via UI (6ab5ef00b56e864cc7e907db).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Public base URL: https://script-to-star.preview.emergentagent.com. Segment tab data-testids verified: create-tab-segment, segment-script-textarea, seg-mode-{slide,clip,storyboard}-radio, seg-length-slider, segment-script-button. Backend /api/stories/create accepts create_mode='segment' and returns segmented:true. Do not attempt to run produce pipeline (Ollama offline).",
+  "rca of the issue": "N/A — all acceptance criteria pass."
+}
