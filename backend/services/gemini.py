@@ -47,11 +47,13 @@ def _record_ok():
 
 
 def gemini_key():
-    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+    from services.keys import get as _get
+    return _get("GEMINI_API_KEY")
 
 
 def openai_key():
-    return (os.environ.get("OPENAI_API_KEY") or "").strip()
+    from services.keys import get as _get
+    return _get("OPENAI_API_KEY")
 
 
 def _retry_wait(text, attempt):

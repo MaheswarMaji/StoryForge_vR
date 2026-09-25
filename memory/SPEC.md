@@ -38,7 +38,7 @@ No seeded test accounts or static credentials are present in the imported reposi
 - Google Veo now receives the approved frame; local Ken Burns remains an explicitly labelled non-generative choice.
 - Studio: configurable service URL, backend-only STUDIO_API_TOKEN, capabilities check, reference upload/character registration, async submit/poll/cancel, authenticated artifact download, retained IDs for recovery, full bible/scene/LoRA/reference payload. Only `succeeded` + strict `production_pass: true` + a non-preview production artifact may enter the final video. QC review does not auto-approve. See STUDIO_API.md for provisional contract extensions.
 - External blockers: direct live probe of newly saved Gemini key returned HTTP 429 RESOURCE_EXHAUSTED with `generate_content_free_tier_requests, limit: 0`. Google project billing/image quota must be enabled by owner. Studio HTTP API is NOT LIVE, and no actual base URL/token has been provided. Adapter implementation is not a remote server installation. Live Studio generation remains unverified; automated contract tests use MOCKED Studio HTTP responses.
-- Public preview: https://tale-craft-122.preview.emergentagent.com
+- Public preview: https://script-to-star.preview.emergentagent.com
 
 ## Local-first narration policy
 - System narration default is Kokoro → XTTS → gTTS. Legacy TTS_PROVIDER_ORDER cannot insert Gemini/OpenAI into this chain. `local:auto`, empty voice and Kokoro selections all use the local-first chain. Explicit XTTS starts at XTTS; explicit gTTS uses gTTS only.

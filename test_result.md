@@ -101,3 +101,124 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: |
+  StoryForge video factory — two-phase fix:
+  Phase 1: Local LLM routing (Ollama-only for all text, strict no-cloud-fallback)
+  Phase 2: Studio-StoryForge coordination (character contamination fix, per-scene cast isolation)
+  Plus: True multi-user per-account key vault isolation
+
+backend:
+  - task: "Local Ollama LLM routing — 4-model task dispatch"
+    implemented: true
+    working: true
+    file: "services/llm.py"
+    stuck_count: 0
+    priority: high
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: main
+        comment: |
+          OLLAMA_BASE_URL=http://127.0.0.1:11434. Strict local-only: when URL is set
+          cloud APIs (Gemini/OpenAI/HF) are NEVER called for text. 4-model routing:
+          ask_json(fast=True)->llama3.1:8b, ask_json()->qwen2.5:72b,
+          ask_json(reasoning=True)->deepseek-r1:32b, ask_json(vision=True)->qwen3-vl:32b-instruct.
+          parse_json() strips deepseek <think> blocks.
+
+  - task: "agents.py — per-task model routing"
+    implemented: true
+    working: true
+    file: "services/agents.py"
+    stuck_count: 0
+    priority: high
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: main
+        comment: |
+          write_script/identify_stories/regenerate_chunk -> ask_json (qwen2.5:72b).
+          editor_pass/run_qa/apply_review_edits/improvement_pass -> ask_json_reasoning (deepseek-r1:32b).
+          make_metadata -> ask_json_fast (llama3.1:8b).
+
+  - task: "Per-account key vault — true multi-user isolation"
+    implemented: true
+    working: true
+    file: "services/keys.py, server.py, job_queue.py, routes.py"
+    stuck_count: 0
+    priority: high
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: main
+        comment: |
+          services/keys.py: ContextVar-based per-request/per-job isolation.
+          When user context IS active, PROVIDER_KEYS come ONLY from that user's vault (db.api_keys).
+          No env bleed between accounts. Empty vault = empty result for provider keys.
+          No context (system jobs) = env fallback for fresh-install compat.
+          server.py: caller_keys() FastAPI dependency loads vault per request.
+          job_queue.py: _execute_job loads owner's vault before running the handler.
+          routes.py: GET/PUT/DELETE /settings/api-keys are now strictly per-user.
+
+  - task: "Studio character table parsing"
+    implemented: true
+    working: true
+    file: "services/studio_local.py"
+    stuck_count: 0
+    priority: high
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: main
+        comment: |
+          characters_from() now handles 3 formats: (1) story.characters list,
+          (2) colon-delimited lines, (3) pipe/tab table (Dhruv-style production briefs).
+          _parse_table_characters() handles ID|Name|Appearance|Restrictions format.
+          Root cause of character contamination: table-format sheet was silently
+          failing, causing characters_from() to raise, and the whole Studio run
+          to fail before images were generated.
+
+  - task: "Studio per-scene cast isolation — fix character contamination"
+    implemented: true
+    working: true
+    file: "services/studio_local.py, script_parser.py"
+    stuck_count: 0
+    priority: high
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: main
+        comment: |
+          build_request() now uses KEY PRESENCE (not truthiness) to distinguish:
+            'cast' key absent   -> no declaration -> _mentions() fallback (old behaviour)
+            'cast' = []         -> explicit empty -> environment-only scene (allowed, no error)
+            'cast' = ['dhruv']  -> explicit list  -> strictly matched to roster
+          script_parser.py: CAST_RE parses **Visible cast:** lines.
+          _extract_cast_ids() returns [] for environment-only, list for explicit,
+          None for undeclared. chunk['cast'] stored ONLY when explicitly declared.
+          BIBLE_START_RE expanded: 'Character consistency sheet', 'Shared visual style'.
+          SCRIPT_START_RE expanded: 'Script, dialogue and visuals'.
+
+metadata:
+  created_by: main_agent
+  version: "1.0"
+  test_sequence: 1
+  run_ui: false
+
+test_plan:
+  current_focus:
+    - "Local Ollama LLM routing"
+    - "Per-account key vault isolation"
+    - "Studio character table parsing + cast isolation"
+  stuck_tasks: []
+  test_all: false
+  test_priority: high_first
+
+agent_communication:
+  - agent: main
+    message: |
+      Phase 1 (LLM) and Phase 2 (Studio) complete. All 5 backend unit checks pass.
+      Backend running on 8001. Ollama routing is local-only when OLLAMA_BASE_URL set.
+      Per-user key vault fully isolated via ContextVar. Studio cast contamination fixed.
+      Next: pipeline order (script→voice→image→compile with incremental retry),
+      voice generation fix (kokoro disk issue), and create-from-script LLM segmentation.

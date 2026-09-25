@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, APIRouter
+from fastapi import Depends, FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -13,13 +13,40 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from db import db
 from routes import router
-from auth import auth_router, verify_auth
+from auth import auth_router, verify_auth, optional_user_id
 from admin import admin_router
 from services.ocr import MEDIA_ROOT
 import job_queue
 import tasks as tasks_mod
 
-app = FastAPI(title="StoryForge API", version="1.0", dependencies=[Depends(verify_auth)])
+
+async def caller_keys(request: Request):
+    """Per-request dependency: loads the signed-in account's key vault into
+    the async context so that services/keys.get() returns only that account's
+    credentials — never another user's keys."""
+    from services import keys
+    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
+    if uid:
+        vals = await keys.load_for_owner(uid)
+        token = keys.set_active(vals)
+        try:
+            yield
+        finally:
+            keys.reset(token)
+    else:
+        # Unauthenticated request: set an empty context (no env bleed for provider keys)
+        token = keys.set_active({})
+        try:
+            yield
+        finally:
+            keys.reset(token)
+
+
+app = FastAPI(
+    title="StoryForge API",
+    version="1.0",
+    dependencies=[Depends(verify_auth), Depends(caller_keys)],
+)
 
 app.add_middleware(
     CORSMiddleware,

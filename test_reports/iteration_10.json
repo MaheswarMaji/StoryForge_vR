@@ -64,7 +64,7 @@
       "name": "signed-out-story-detail-no-errors (ingress cross-check)",
       "lane": "browser",
       "status": "passed",
-      "evidence": "Covered by the same check above, run against https://tale-craft-122.preview.emergentagent.com; curl to https://tale-craft-122.preview.emergentagent.com/api/ independently returned {message:'StoryForge API is running'}."
+      "evidence": "Covered by the same check above, run against https://script-to-star.preview.emergentagent.com; curl to https://script-to-star.preview.emergentagent.com/api/ independently returned {message:'StoryForge API is running'}."
     }
   ],
   "bugs": [],

@@ -8,7 +8,7 @@
       "name": "settings-media-engine-defaults-persist",
       "lane": "browser",
       "status": "passed",
-      "evidence": "On https://tale-craft-122.preview.emergentagent.com/settings: confirmed initial defaults gemini/kenburns, changed to auto/gemini_veo, saved (toast 'Default media engines saved'), full page reload showed auto/gemini_veo persisted via GET /api/settings/media-engines, then restored to gemini/kenburns and saved+reloaded again confirming restoration. 4 screenshots captured."
+      "evidence": "On https://script-to-star.preview.emergentagent.com/settings: confirmed initial defaults gemini/kenburns, changed to auto/gemini_veo, saved (toast 'Default media engines saved'), full page reload showed auto/gemini_veo persisted via GET /api/settings/media-engines, then restored to gemini/kenburns and saved+reloaded again confirming restoration. 4 screenshots captured."
     },
     {
       "criterion": "Stories and segments override or inherit defaults without rewriting supplied scripts",
@@ -78,7 +78,7 @@
       "name": "public-journeys-no-overflow-no-errors",
       "lane": "browser",
       "status": "passed",
-      "evidence": "Against https://tale-craft-122.preview.emergentagent.com: /settings and /create checked at 1280x800 (desktop) and 390x844 (mobile) — document.scrollWidth<=clientWidth+2px on all four page/viewport combinations (no horizontal overflow), zero console_errors captured, 4 screenshots taken."
+      "evidence": "Against https://script-to-star.preview.emergentagent.com: /settings and /create checked at 1280x800 (desktop) and 390x844 (mobile) — document.scrollWidth<=clientWidth+2px on all four page/viewport combinations (no horizontal overflow), zero console_errors captured, 4 screenshots taken."
     },
     {
       "criterion": "Public browser journeys and strict TypeScript remain functional",

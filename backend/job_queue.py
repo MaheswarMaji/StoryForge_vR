@@ -73,7 +73,25 @@ async def _execute_job(job, idx):
     """Run one claimed job to completion and record its terminal status."""
     job_id = job["_id"]
     from services.generation import generation_context, record_event, redact
+    from services import keys as _keys
+
+    # ── Set generation context (story_id, job_id) ─────────────────────────
     context_token = generation_context.set({'story_id': job.get('ref_id', ''), 'job_id': job_id})
+
+    # ── Load per-owner keys into async context ────────────────────────────
+    owner_id = ""
+    ref = job.get("ref_id") or ""
+    if ref and ref != "system":
+        story = await db.stories.find_one({"_id": ref}, {"owner_id": 1})
+        if not story:
+            book = await db.books.find_one({"_id": ref}, {"owner_id": 1})
+            story = book
+        owner_id = (story or {}).get("owner_id", "")
+    if not owner_id:
+        owner_id = await _keys.system_owner_id()
+    owner_vals = await _keys.load_for_owner(owner_id)
+    keys_token = _keys.set_active(owner_vals)
+
     try:
         HEARTBEAT["active"] += 1
         HEARTBEAT["last_beat"] = now()
@@ -106,6 +124,7 @@ async def _execute_job(job, idx):
             )
     finally:
         generation_context.reset(context_token)
+        _keys.reset(keys_token)
         HEARTBEAT["active"] = max(0, HEARTBEAT["active"] - 1)
         HEARTBEAT["last_beat"] = now()
 

@@ -702,18 +702,48 @@ async def engagement_sync():
     return {"job_id": job_id}
 
 
-# ---------- integration settings ----------
-ALLOWED_VAULT_KEYS = {"OPENAI_API_KEY", "GEMINI_API_KEY", "FAL_KEY", "HF_TOKEN",
-                      "REPLICATE_API_TOKEN", "PEXELS_API_KEY", "STABILITY_API_KEY", "YOUTUBE_CLIENT_ID",
-                      "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN", "INSTAGRAM_ACCESS_TOKEN",
-                      "INSTAGRAM_USER_ID", "STUDIO_API_TOKEN"}
+# ---------- per-user API key vault ----------
+# Each account keeps its own provider keys — completely isolated from other users.
+# PROVIDER_KEYS is the authoritative list; keys outside it are silently ignored.
+from services.keys import PROVIDER_KEYS as _PROVIDER_KEYS
+
+# Keep backwards compat alias used by server.py _load_key_vault
+ALLOWED_VAULT_KEYS = set(_PROVIDER_KEYS) | {
+    "YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN",
+    "INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_USER_ID",
+}
+
+KEY_LABELS = {
+    "OPENAI_API_KEY":         "OpenAI — DALL·E / GPT image generation",
+    "GEMINI_API_KEY":         "Google Gemini — Veo video, image generation, TTS",
+    "GEMINI_API_KEY":         "Google Gemini — Veo video, image generation, TTS",
+    "FAL_KEY":                "fal.ai — FLUX / SDXL images, Wan video clips",
+    "REPLICATE_API_TOKEN":    "Replicate — FLUX images, Wan 2.1 clips",
+    "HF_TOKEN":               "Hugging Face — free hosted image / text APIs",
+    "STABILITY_API_KEY":      "Stability AI — Stable Image Core / SD3.5",
+    "PEXELS_API_KEY":         "Pexels — free real photos & video clips",
+    "STUDIO_API_TOKEN":       "Studio HTTP API token (future remote worker)",
+}
 
 
 @router.get("/settings/api-keys")
-async def get_api_keys():
-    return {k: {"set": bool((os.environ.get(k) or "").strip()),
-                "hint": "configured" if (os.environ.get(k, "") or "").strip() else ""}
-            for k in sorted(ALLOWED_VAULT_KEYS)}
+async def get_api_keys(request: Request):
+    """Return the signed-in account's configured key names (values never returned)."""
+    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
+    from services import keys as _keys
+    if uid:
+        configured = await _keys.configured_for_owner(uid)
+    else:
+        # Unauthenticated: show env-level status (admin convenience)
+        configured = {k: bool((os.environ.get(k) or "").strip()) for k in _PROVIDER_KEYS}
+    return {
+        k: {
+            "set":   configured.get(k, False),
+            "label": KEY_LABELS.get(k, k),
+            "hint":  "configured" if configured.get(k) else "",
+        }
+        for k in sorted(_PROVIDER_KEYS)
+    }
 
 
 class KeysBody(BaseModel):
@@ -721,41 +751,42 @@ class KeysBody(BaseModel):
 
 
 @router.put("/settings/api-keys")
-async def save_api_keys(body: KeysBody):
-    from services import social
-    saved = []
-    for k, v in (body.values or {}).items():
-        if k not in ALLOWED_VAULT_KEYS or not str(v).strip():
-            continue
-        os.environ[k] = str(v).strip()
-        saved.append(k)
+async def save_api_keys(body: KeysBody, request: Request):
+    """Save provider keys into the signed-in account's vault."""
+    from services import keys as _keys, social
+    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
+    if not uid:
+        raise HTTPException(401, "sign in to save API keys")
+    saved = await _keys.save_for_owner(uid, body.values or {})
     if saved:
-        doc = await db.settings.find_one({"key": "api_keys"}) or {"key": "api_keys", "values": {}}
-        vals = doc.get("values", {})
-        for k in saved:
-            vals[k] = os.environ[k]
-        await db.settings.update_one({"key": "api_keys"},
-                                     {"$set": {"values": vals, "updated_at": utcnow()}}, upsert=True)
+        # Reload active context so the current request sees the new keys
+        vals = await _keys.load_for_owner(uid)
+        _keys.set_active(vals)
         from services.generation import reset_provider_health
         reset_provider_health()
         if "INSTAGRAM_ACCESS_TOKEN" in saved or "INSTAGRAM_USER_ID" in saved:
-            social.set_ig_creds(os.environ.get("INSTAGRAM_ACCESS_TOKEN", ""),
-                                os.environ.get("INSTAGRAM_USER_ID", ""), "vault")
+            ak = await _keys.load_for_owner(uid)
+            social.set_ig_creds(ak.get("INSTAGRAM_ACCESS_TOKEN", ""),
+                                ak.get("INSTAGRAM_USER_ID", ""), "vault")
     return {"saved": saved}
 
 
 @router.delete("/settings/api-keys/{name}")
-async def delete_api_key(name: str):
-    from services import social
-    if name not in ALLOWED_VAULT_KEYS:
+async def delete_api_key(name: str, request: Request):
+    """Wipe one provider key from the signed-in account's vault."""
+    from services import keys as _keys, social
+    if name not in _PROVIDER_KEYS:
         raise HTTPException(400, "unknown key")
-    os.environ[name] = ""
-    await db.settings.update_one({"key": "api_keys"}, {"$set": {f"values.{name}": ""}}, upsert=True)
+    uid = getattr(request.state, "user_id", None) or await optional_user_id(request)
+    if not uid:
+        raise HTTPException(401, "sign in to clear API keys")
+    await _keys.clear_for_owner(uid, name)
     from services.generation import reset_provider_health
     reset_provider_health()
     if name in ("INSTAGRAM_ACCESS_TOKEN", "INSTAGRAM_USER_ID"):
-        social.set_ig_creds(os.environ.get("INSTAGRAM_ACCESS_TOKEN", ""),
-                            os.environ.get("INSTAGRAM_USER_ID", ""), "vault")
+        ak = await _keys.load_for_owner(uid)
+        social.set_ig_creds(ak.get("INSTAGRAM_ACCESS_TOKEN", ""),
+                            ak.get("INSTAGRAM_USER_ID", ""), "vault")
     return {"cleared": name}
 
 

@@ -32,7 +32,8 @@ def available(provider: str) -> bool:
 
 
 def _key(name: str) -> str:
-    return (os.environ.get(name) or "").strip()
+    from services.keys import get as _keys_get
+    return _keys_get(name)
 
 
 def chain(kind: str) -> list:

@@ -29,7 +29,7 @@
       "name": "create-from-script-structured-import",
       "lane": "browser",
       "status": "passed",
-      "evidence": "Against https://tale-craft-122.preview.emergentagent.com/create: filled title + pasted the Hindi Consistency Bible + 3-scene script, clicked Create; POST /api/stories/create returned {imported:true, imported_segments:3, job_id:null}; navigated to Story Studio showing title, 'Loaded 3 supplied scenes' stage, toast '3 supplied scenes loaded exactly — no dialogue or visual regeneration', segment-voiceover-{0,1,2} showing the exact supplied नैरेशन/संवाद text, character-sheet-locked-badge visible with anchor containing the supplied character lines, and produce-video-cta visible (NOT clicked, per spec deviation, to avoid spending credits). Zero >=400 /api/ responses and zero page errors captured during the flow."
+      "evidence": "Against https://script-to-star.preview.emergentagent.com/create: filled title + pasted the Hindi Consistency Bible + 3-scene script, clicked Create; POST /api/stories/create returned {imported:true, imported_segments:3, job_id:null}; navigated to Story Studio showing title, 'Loaded 3 supplied scenes' stage, toast '3 supplied scenes loaded exactly — no dialogue or visual regeneration', segment-voiceover-{0,1,2} showing the exact supplied नैरेशन/संवाद text, character-sheet-locked-badge visible with anchor containing the supplied character lines, and produce-video-cta visible (NOT clicked, per spec deviation, to avoid spending credits). Zero >=400 /api/ responses and zero page errors captured during the flow."
     }
   ],
   "bugs": [],

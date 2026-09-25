@@ -1,6 +1,8 @@
 import json
 
-from services.llm import ask_json, estimate_llm_cost
+from services.llm import ask_json, ask_json_fast, ask_json_reasoning, estimate_llm_cost
+
+# ── System prompts ────────────────────────────────────────────────────────────
 
 STORY_SYSTEM = (
     "You are an expert story analyst for Indian mythology (Puranas, Bhagwat, Ramayana, Mahabharata), "
@@ -39,6 +41,8 @@ IMPROVE_SYSTEM = (
 )
 
 
+# ── Story identification ──────────────────────────────────────────────────────
+
 async def identify_stories(book_title: str, text: str, channel_name: str):
     prompt = f"""Read the following OCR text from the scanned book "{book_title}" and identify ALL self-contained stories suitable for 60-120 second vertical videos for the channel "{channel_name}".
 
@@ -56,11 +60,14 @@ Return JSON: {{"stories": [ ... ]}}. If no suitable story is found return {{"sto
 
 OCR TEXT:
 {text[:22000]}"""
+    # Creative/analytical task → main model (qwen2.5:72b)
     data = await ask_json(STORY_SYSTEM, prompt, session="story-id")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     stories = data.get("stories", []) if isinstance(data, dict) else []
     return stories, cost
 
+
+# ── Script writing ────────────────────────────────────────────────────────────
 
 async def write_script(story: dict, channel: dict, target_seconds: int = 90):
     target_seconds = max(30, min(240, int(target_seconds or 90)))
@@ -84,28 +91,31 @@ STORY JSON:
 REQUIREMENTS:
 - EXACTLY {n_chunks} chunks of ~10 seconds each (total ≈ {target_seconds}s; may run ±15%).
 - Across the chunks, cover ALL SIX beats in order: hook (first chunk), story, twist, climax, action, lesson. Multiple chunks may share a beat (e.g. two 'story' chunks), but hook is only chunk 1 and lesson is the last chunk which must end with the CTA woven naturally.
-- Each chunk: "beat" (hook|story|twist|climax|action|lesson), "voiceover" (max 28 words, spoken word for word; chunk 1 must be an irresistible question or shocking line), "visual" (one-line scene summary), "video_prompt" (DETAILED English prompt for AI image generation: style, subject, action, setting, lighting, mood; 9:16 vertical; visuals must REVEAL information the narration does not state verbatim), "camera" (zoom_in|zoom_out|pan_left|pan_right|static), "emotion", "music_mood" (devotional|suspense|horror|moral|action|sad|happy).
+- Each chunk: "beat" (hook|story|twist|climax|action|lesson), "voiceover" (max 28 words, spoken word for word; chunk 1 must be an irresistible question or shocking line), "visual" (one-line scene summary), "video_prompt" (DETAILED English prompt for AI image generation: style, subject, action, setting, lighting, mood; 9:16 vertical; visuals must REVEAL information the narration does not state verbatim), "camera" (zoom_in|zoom_out|pan_left|pan_right|static), "emotion", "music_mood" (devotional|suspense|horror|moral|action|sad|happy), "cast" (list of character IDs from the character sheet who are PHYSICALLY VISIBLE in this scene — use exact IDs, empty list [] for environment-only scenes).
 - "character_sheet": {{"anchor": a single dense paragraph describing EVERY recurring character's exact appearance (age, face, hair, clothing colors, build, accessories) plus the global art style and color palette — this anchor will be reused verbatim for every generated image to keep characters identical across segments.}}
 - "voice": {{"language", "tone"}}, "music": {{"instruments": [..]}}, "cta_text".
 
 Return ONLY valid JSON."""
+    # Creative writing → main model (qwen2.5:72b)
     data = await ask_json(SCRIPT_SYSTEM, prompt, session="script")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     return data, cost
 
 
+# ── Segment regeneration ──────────────────────────────────────────────────────
+
 async def regenerate_chunk(story: dict, channel: dict, index: int):
     chunks = (story.get("script") or {}).get("chunks") or []
     if index < 0 or index >= len(chunks):
         raise ValueError("invalid segment index")
-    current = chunks[index]
+    current  = chunks[index]
     previous = chunks[index - 1] if index > 0 else {}
     following = chunks[index + 1] if index + 1 < len(chunks) else {}
     prompt = f"""Rewrite only segment {index + 1} of this short vertical video script.
 
 Keep the story facts, beat ({current.get('beat', 'story')}), language, recurring characters, and continuity intact.
 Make the narration natural to speak in about 8-12 seconds. Make the visual reveal a specific cinematic moment rather than repeating the narration.
-Return ONLY JSON with exactly these string fields: voiceover, visual, video_prompt.
+Return ONLY JSON with exactly these string fields: voiceover, visual, video_prompt, cast (list of visible character IDs for this scene — empty list [] for environment-only).
 The video_prompt must be a detailed English prompt for a high-quality 9:16 image/video frame: clear subject, action, setting, lighting, mood, anatomy, composition, no text, no watermark.
 
 CHANNEL: {json.dumps({k: channel.get(k) for k in ('name', 'language', 'tone', 'is_kids')}, ensure_ascii=False)}
@@ -113,12 +123,15 @@ CHARACTER SHEET: {(story.get('character_sheet') or {}).get('anchor', '')[:1800]}
 PREVIOUS SEGMENT: {json.dumps(previous, ensure_ascii=False, default=str)}
 CURRENT SEGMENT: {json.dumps(current, ensure_ascii=False, default=str)}
 NEXT SEGMENT: {json.dumps(following, ensure_ascii=False, default=str)}"""
+    # Creative rewrite → main model (qwen2.5:72b)
     data = await ask_json(SCRIPT_SYSTEM, prompt, session=f"segment-script-{index}")
     cost = estimate_llm_cost(prompt, json.dumps(data, ensure_ascii=False))
     if not isinstance(data, dict) or not data.get("voiceover") or not data.get("video_prompt"):
         raise ValueError("segment rewrite returned incomplete data")
     return data, cost
 
+
+# ── Review edits ──────────────────────────────────────────────────────────────
 
 async def apply_review_edits(story: dict, channel: dict, notes: str):
     prompt = f"""Apply the reviewer's requested edits to this short vertical video script.
@@ -127,7 +140,7 @@ Reviewer notes:
 {notes[:4000]}
 
 Return ONLY JSON with:
-- edits: a list of at most 6 objects, each with index (integer) and any changed string fields among voiceover, visual, video_prompt, camera, emotion
+- edits: a list of at most 6 objects, each with index (integer) and any changed string fields among voiceover, visual, video_prompt, camera, emotion, cast (list of visible character IDs for that scene)
 - summary: one short sentence describing what was changed
 
 Only edit the segments needed by the notes. Preserve source facts, recurring-character continuity, the beat order, and the channel language. Keep video_prompt detailed, cinematic, English, vertical 9:16, with no text or watermark.
@@ -135,17 +148,20 @@ Only edit the segments needed by the notes. Preserve source facts, recurring-cha
 CHANNEL: {json.dumps({k: channel.get(k) for k in ('name', 'language', 'tone', 'is_kids')}, ensure_ascii=False)}
 CHARACTER SHEET: {(story.get('character_sheet') or {}).get('anchor', '')[:1800]}
 SCRIPT: {json.dumps(story.get('script') or {}, ensure_ascii=False, default=str)}"""
-    data = await ask_json(EDITOR_SYSTEM, prompt, session="review-edits")
+    # Editing/reasoning → deepseek-r1:32b
+    data = await ask_json_reasoning(EDITOR_SYSTEM, prompt, session="review-edits")
     cost = estimate_llm_cost(prompt, json.dumps(data, ensure_ascii=False))
     if not isinstance(data, dict) or not isinstance(data.get("edits"), list):
         raise ValueError("review edit response was incomplete")
     return data, cost
 
 
+# ── QA ────────────────────────────────────────────────────────────────────────
+
 async def run_qa(story: dict, channel: dict):
     prompt = """QA-check this short-video script. Evaluate:
 1. beats_present — all six beats hook/story/twist/climax/action/lesson appear across chunks (check the "beat" fields AND narrative content)
-2. character_consistency — visual prompts + character sheet keep recurring characters/places visually identical
+2. character_consistency — visual prompts + character sheet keep recurring characters/places visually identical; cast lists match image prompts
 3. pacing — 6-8 chunks, no voiceover over ~32 words (chunk would overrun ~10s), hook lands in first 5s
 4. content_safety — vs channel safety level "{safety}"{kids}
 5. hook_strength — rate 0-10 (>7 to pass)
@@ -158,13 +174,17 @@ SCRIPT: {script}"""
     prompt = prompt.format(
         safety=channel.get("safety_level"),
         kids=" — age-appropriate for children, playful not terrifying" if channel.get("is_kids") else "",
-        ch=json.dumps({k: channel.get(k) for k in ("name", "tone", "is_kids", "safety_level")}, ensure_ascii=False, default=str),
+        ch=json.dumps({k: channel.get(k) for k in ("name", "tone", "is_kids", "safety_level")},
+                      ensure_ascii=False, default=str),
         script=json.dumps(story.get("script", {}), ensure_ascii=False, default=str),
     )
-    data = await ask_json(QA_SYSTEM, prompt, session="qa")
+    # QA/evaluation → deepseek-r1:32b
+    data = await ask_json_reasoning(QA_SYSTEM, prompt, session="qa")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     return data, cost
 
+
+# ── Metadata ──────────────────────────────────────────────────────────────────
 
 async def make_metadata(story: dict, channel: dict):
     prompt = f"""Generate viral publishing metadata for a 60-120s YouTube Shorts / Instagram Reels video.
@@ -174,10 +194,13 @@ Script hook: {story.get('script', {}).get('chunks', [{}])[0].get('voiceover', ''
 Channel: {channel.get('name')}
 
 Return JSON: {{"title": str (<=95 chars, curiosity gap, Hinglish welcome), "description": str (2-3 lines + moral + call to action), "hashtags": [str] (12-18 relevant, mix broad + niche, no # symbol), "thumbnail_text": str (<=5 punchy words for the thumbnail, matching narration language or English)}}"""
-    data = await ask_json(METADATA_SYSTEM, prompt, session="meta")
+    # Simple structured output → llama3.1:8b
+    data = await ask_json_fast(METADATA_SYSTEM, prompt, session="meta")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     return data, cost
 
+
+# ── Editor pass ───────────────────────────────────────────────────────────────
 
 async def editor_pass(story: dict, channel: dict, source_text: str):
     prompt = f"""Review this short-video script against the SOURCE TEXT below.
@@ -202,10 +225,13 @@ Return ONLY valid JSON:
  "silence_before_index": int (segment index AFTER which 0.6s dramatic silence plays; -1 if none),
  "viral_score": {{"total": int, "concept": int, "curiosity": int, "emotion": int, "novelty": int, "thumbnail": int, "title": int, "hook": int, "structure": int, "shareability": int, "verdict": str (one line: reject <60 | weak 60-70 | interesting 70-80 | strong 80-90 | produce first 90+)}},
  "editor_notes": [str] (max 5 short human-readable notes)}}"""
-    data = await ask_json(EDITOR_SYSTEM, prompt, session="editor")
+    # Fact-checking/reasoning → deepseek-r1:32b
+    data = await ask_json_reasoning(EDITOR_SYSTEM, prompt, session="editor")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     return data, cost
 
+
+# ── Improvement pass ──────────────────────────────────────────────────────────
 
 async def improvement_pass(story: dict, channel: dict, history: list):
     prompt = f"""A short video was produced and assessed by the editor. Pinpoint the EXACT scope of improvement and propose minimal targeted edits that raise the overall viral score.
@@ -231,6 +257,7 @@ RULES:
 
 Return ONLY valid JSON:
 {{"scope": str, "why": str (one line), "edits": [{{"index": int, "voiceover": str, "visual": str, "video_prompt": str, "reason": str}}], "hook_line": str (improved chunk-0 voiceover, or "" if already strong), "expected_gain": int}}"""
-    data = await ask_json(IMPROVE_SYSTEM, prompt, session="improve")
+    # Reasoning → deepseek-r1:32b
+    data = await ask_json_reasoning(IMPROVE_SYSTEM, prompt, session="improve")
     cost = estimate_llm_cost(prompt, json.dumps(data))
     return data, cost
