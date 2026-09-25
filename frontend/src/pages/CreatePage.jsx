@@ -116,6 +116,87 @@ function ScriptCreator({ title, types, vtype, setVtype, busy, setBusy }) {
   );
 }
 
+function ScriptSegmenter({ title, types, vtype, setVtype, busy, setBusy }) {
+  const [source, setSource] = useState("");
+  const [mode, setMode] = useState("storyboard");
+  const [length, setLength] = useState(90);
+  const navigate = useNavigate();
+
+  const submit = async () => {
+    if (!source.trim()) {
+      toast.error("Paste your full script first");
+      return;
+    }
+    setBusy(true);
+    try {
+      const { data } = await api.post("/stories/create", {
+        title, source_text: source, video_type: vtype, length_seconds: length, mode,
+        create_mode: "segment",
+      });
+      toast.success("Segmenting your script on the local CPU model — character sheet, cast, narration & visuals are being built");
+      navigate(`/stories/${data.story_id}`);
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Segmentation failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div>
+        <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-slate-400">Paste your full script — narration &amp; dialogue *</label>
+        <Textarea data-testid="segment-script-textarea" value={source} onChange={(e) => setSource(e.target.value)} rows={9}
+          placeholder={"Paste a complete story or screenplay in any format.\nThe local LLM (qwen2.5:72b / deepseek-r1:32b — auto-picked to fit CPU RAM) keeps your wording and builds:\n• one character-consistency sheet\n• per-scene visible cast\n• ~10s scene narration\n• detailed 9:16 visual prompts"}
+          className="border-white/10 bg-black/30 text-sm leading-relaxed text-slate-200" />
+        <p className="mt-1.5 text-[11px] leading-relaxed text-emerald-300/80">
+          Your narration &amp; dialogue are preserved — the model only structures the script, it does not rewrite the story.
+        </p>
+      </div>
+
+      <TypeGrid types={types} vtype={vtype} setVtype={setVtype} />
+
+      <div className="grid gap-5 sm:grid-cols-2">
+        <div>
+          <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-slate-400">Production style</label>
+          <div className="grid grid-cols-3 gap-2.5">
+            <button data-testid="seg-mode-slide-radio" onClick={() => setMode("slide")}
+              className={`flex flex-col items-center gap-1.5 rounded-xl border p-4 transition-colors ${mode === "slide" ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-200" : "border-white/10 bg-black/30 text-slate-400"}`}>
+              <Images className="h-5 w-5" />
+              <span className="text-xs font-semibold">Slide-based</span>
+            </button>
+            <button data-testid="seg-mode-clip-radio" onClick={() => setMode("clip")}
+              className={`flex flex-col items-center gap-1.5 rounded-xl border p-4 transition-colors ${mode === "clip" ? "border-fuchsia-500/60 bg-fuchsia-500/10 text-fuchsia-200" : "border-white/10 bg-black/30 text-slate-400"}`}>
+              <Film className="h-5 w-5" />
+              <span className="text-xs font-semibold">AI video clips</span>
+            </button>
+            <button data-testid="seg-mode-storyboard-radio" onClick={() => setMode("storyboard")}
+              className={`flex flex-col items-center gap-1.5 rounded-xl border p-4 transition-colors ${mode === "storyboard" ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-200" : "border-white/10 bg-black/30 text-slate-400"}`}>
+              <LayoutGrid className="h-5 w-5" />
+              <span className="text-xs font-semibold">Storyboard</span>
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-slate-400">Target length: <span className="text-amber-300">{length}s</span></label>
+          <input data-testid="seg-length-slider" type="range" min="30" max="240" step="15" value={length}
+            onChange={(e) => setLength(Number(e.target.value))}
+            className="mt-3 w-full accent-amber-500" />
+          <div className="mt-1 flex justify-between text-[10px] text-slate-500"><span>30s</span><span>2 min</span><span>4 min</span></div>
+        </div>
+      </div>
+
+      <Button data-testid="segment-script-button" onClick={submit} disabled={busy} className="w-full bg-emerald-500 py-3 font-semibold text-[#090A0F] hover:bg-emerald-400">
+        {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Wand2 className="mr-2 h-4 w-4" />}
+        Segment Script &amp; Open Story Studio
+      </Button>
+      <p className="text-[11px] leading-relaxed text-slate-500">
+        Runs entirely on your local Ollama CPU model. Once segmented, review the scenes and cast in Story Studio, then produce.
+      </p>
+    </>
+  );
+}
+
 function MediaStitcher({ title, types, vtype, setVtype, busy, setBusy }) {
   const [items, setItems] = useState([]);
   const [uploading, setUploading] = useState(false);
@@ -282,13 +363,17 @@ export default function CreatePage() {
         <p className="mt-1 text-sm text-slate-400">Let the AI write and produce from a prompt — or bring your own footage and let the studio stitch it into a polished Short.</p>
       </div>
 
-      <div className="grid grid-cols-2 gap-2.5 sm:max-w-md">
+      <div className="grid grid-cols-3 gap-2.5 sm:max-w-2xl">
         <button data-testid="create-tab-ai" onClick={() => setTab("ai")}
-          className={`flex items-center justify-center gap-2 rounded-xl border px-4 py-3 text-sm font-semibold transition-colors ${tab === "ai" ? "border-amber-500/60 bg-amber-500/10 text-amber-300" : "border-white/10 bg-black/30 text-slate-400 hover:border-amber-500/30"}`}>
+          className={`flex items-center justify-center gap-2 rounded-xl border px-3 py-3 text-xs font-semibold transition-colors sm:text-sm ${tab === "ai" ? "border-amber-500/60 bg-amber-500/10 text-amber-300" : "border-white/10 bg-black/30 text-slate-400 hover:border-amber-500/30"}`}>
           <Wand2 className="h-4 w-4" /> Script or prompt
         </button>
+        <button data-testid="create-tab-segment" onClick={() => setTab("segment")}
+          className={`flex items-center justify-center gap-2 rounded-xl border px-3 py-3 text-xs font-semibold transition-colors sm:text-sm ${tab === "segment" ? "border-emerald-500/60 bg-emerald-500/10 text-emerald-300" : "border-white/10 bg-black/30 text-slate-400 hover:border-emerald-500/30"}`}>
+          <Sparkles className="h-4 w-4" /> Segment my script
+        </button>
         <button data-testid="create-tab-media" onClick={() => setTab("media")}
-          className={`flex items-center justify-center gap-2 rounded-xl border px-4 py-3 text-sm font-semibold transition-colors ${tab === "media" ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-300" : "border-white/10 bg-black/30 text-slate-400 hover:border-cyan-500/30"}`}>
+          className={`flex items-center justify-center gap-2 rounded-xl border px-3 py-3 text-xs font-semibold transition-colors sm:text-sm ${tab === "media" ? "border-cyan-500/60 bg-cyan-500/10 text-cyan-300" : "border-white/10 bg-black/30 text-slate-400 hover:border-cyan-500/30"}`}>
           <Upload className="h-4 w-4" /> Stitch my own media
         </button>
       </div>
@@ -299,9 +384,9 @@ export default function CreatePage() {
           <Input data-testid="create-title-input" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. The Boy Who Shared His Last Roti" className="border-white/10 bg-black/30 text-slate-200" />
         </div>
 
-        {tab === "ai"
-          ? <ScriptCreator title={title} types={types} vtype={vtype} setVtype={setVtype} busy={busy} setBusy={setBusy} />
-          : <MediaStitcher title={title} types={types} vtype={vtype} setVtype={setVtype} busy={busy} setBusy={setBusy} />}
+        {tab === "ai" && <ScriptCreator title={title} types={types} vtype={vtype} setVtype={setVtype} busy={busy} setBusy={setBusy} />}
+        {tab === "segment" && <ScriptSegmenter title={title} types={types} vtype={vtype} setVtype={setVtype} busy={busy} setBusy={setBusy} />}
+        {tab === "media" && <MediaStitcher title={title} types={types} vtype={vtype} setVtype={setVtype} busy={busy} setBusy={setBusy} />}
       </div>
     </div>
   );

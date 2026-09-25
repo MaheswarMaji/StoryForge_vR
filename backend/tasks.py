@@ -91,6 +91,53 @@ async def run_script_job(job, setp):
         "cost.llm": round(cost, 5), "cost.total": round(cost, 5)}})
 
 
+async def run_script_segment_job(job, setp):
+    """LLM-segment a pasted freeform script into scenes + cast + character sheet (CPU model)."""
+    story_id = job["ref_id"]
+    story = await db.stories.find_one({"_id": story_id})
+    if not story:
+        raise RuntimeError("story not found")
+    channel = await db.channels.find_one({"_id": story["channel_id"]})
+    await db.stories.update_one({"_id": story_id},
+        {"$set": {"status": "scripting", "stage": "Segmenting your script (local CPU LLM)", "error": ""}})
+    await setp(20, "Reading & segmenting your script")
+    data, cost = await agents.segment_script(story, channel or {},
+                                             int(story.get("target_seconds") or 90))
+
+    chunks = [c for c in (data.get("chunks") or []) if isinstance(c, dict)][:24]
+    for c in chunks:
+        if isinstance(c.get("cast"), str):
+            c["cast"] = [c["cast"]]
+        elif not isinstance(c.get("cast"), list):
+            c.pop("cast", None)
+    characters = [c for c in (data.get("characters") or [])
+                  if isinstance(c, dict) and c.get("name") and c.get("description")]
+    cs = data.get("character_sheet") if isinstance(data.get("character_sheet"), dict) else {}
+    anchor = (cs.get("anchor") or "").strip() or "; ".join(
+        f"{c['name']}: {c['description']}" for c in characters)
+    script = {
+        "chunks": chunks,
+        "character_sheet": {"anchor": anchor},
+        "segmented_from_script": True,
+        "production_notes": "",
+    }
+    await setp(80, f"Structured into {len(chunks)} scenes")
+    title = (data.get("title") or "").strip()
+    update = {
+        "script": script, "status": "script_ready",
+        "stage": f"Segmented into {len(chunks)} scenes — ready to render",
+        "characters": characters,
+        "character_sheet": {"anchor": anchor, "text": anchor, "locked": bool(anchor),
+                            "visuals_stale": False, "version": 1},
+        "updated_at": utcnow(),
+    }
+    if title and not (story.get("title_english") or "").strip():
+        update["title_english"] = title[:100]
+        update["title_hindi"] = title
+    await db.stories.update_one({"_id": story_id}, {"$set": update, "$inc": {
+        "cost.llm": round(cost, 5), "cost.total": round(cost, 5)}})
+
+
 async def run_produce_job(job, setp):
     from pipeline import produce_video
     await produce_video(job["ref_id"], setp, job_id=job["_id"])
@@ -235,6 +282,7 @@ def register_all():
     register("ocr", run_ocr_job)
     register("segment", run_segment_job)
     register("script", run_script_job)
+    register("script_segment", run_script_segment_job)
     register("produce", run_produce_job)
     register("segment_fix", run_segment_fix_job)
     register("edit_request", run_edit_request_job)

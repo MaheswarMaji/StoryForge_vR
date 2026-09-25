@@ -313,6 +313,7 @@ class CreateBody(BaseModel):
     video_type: str = "mythology_moral"
     length_seconds: int = 90
     mode: str = "slide"  # slide | clip
+    create_mode: str = "auto"  # auto (parse-verbatim / AI-write) | segment (LLM segment existing script)
 
 
 @router.post("/stories/create")
@@ -338,10 +339,30 @@ async def create_story(body: CreateBody, request: Request):
                          mode=mode, video_type=body.video_type)
         await db.channels.insert_one(ch_doc.to_mongo())
         ch = await db.channels.find_one({"key": key})
+    owner_id = await optional_user_id(request)
+
+    # ── Segment an existing script with the local CPU LLM ─────────────────────
+    if body.create_mode == "segment":
+        supplied_title = body.title.strip()
+        story = Story(book_id=f"prompt-{utcnow().strftime('%Y%m%d-%H%M%S')}", channel_id=ch["_id"],
+                      owner_id=owner_id,
+                      title_hindi=supplied_title, title_english=supplied_title[:100],
+                      source="Pasted script — LLM segmented", category=cfg["name"],
+                      target_seconds=target, mode=mode,
+                      source_text=body.source_text.strip()[:20000],
+                      emotional_tone=cfg["tone"][:60], target_audience=cfg["audience"],
+                      visual_style=cfg["style_prefix"][:120], estimated_length=f"{target}s",
+                      status="scripting", stage="Queued for local CPU segmentation", script={})
+        await db.stories.insert_one(story.to_mongo())
+        job_id = await enqueue("script_segment", story.id,
+                               f"Segment script: {supplied_title[:40] or story.id}")
+        return {"story_id": story.id, "job_id": job_id, "imported": False, "segmented": True,
+                "imported_segments": 0, "is_partial": False,
+                "missing": {"voiceover": [], "visual": [], "video_prompt": []}}
+
     parsed = parse_scene_script(body.source_text)
     supplied_title = body.title.strip() or ((parsed or {}).get("title") or "")
     bible = ((parsed or {}).get("character_sheet") or "").strip()
-    owner_id = await optional_user_id(request)
     script_payload = {}
     if parsed:
         script_payload = {
@@ -715,7 +736,6 @@ ALLOWED_VAULT_KEYS = set(_PROVIDER_KEYS) | {
 
 KEY_LABELS = {
     "OPENAI_API_KEY":         "OpenAI — DALL·E / GPT image generation",
-    "GEMINI_API_KEY":         "Google Gemini — Veo video, image generation, TTS",
     "GEMINI_API_KEY":         "Google Gemini — Veo video, image generation, TTS",
     "FAL_KEY":                "fal.ai — FLUX / SDXL images, Wan video clips",
     "REPLICATE_API_TOKEN":    "Replicate — FLUX images, Wan 2.1 clips",

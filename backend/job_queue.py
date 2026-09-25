@@ -9,9 +9,11 @@ log = logging.getLogger("queue")
 
 HEARTBEAT = {"last_beat": None, "active": 0, "workers": 0}
 HANDLERS = {}
-PRIORITY = {"produce": 0, "publish": 0, "improve": 0, "script": 1, "segment_fix": 1, "edit_request": 1,
+PRIORITY = {"produce": 0, "publish": 0, "improve": 0, "script": 1, "script_segment": 1,
+            "segment_fix": 1, "edit_request": 1,
             "ocr": 2, "segment": 2, "news": 3, "engagement": 3}
 FAILURE_COLLECTION = {"ocr": "books", "segment": "books", "script": "stories",
+                      "script_segment": "stories",
                       "produce": "stories", "segment_fix": "stories", "edit_request": "stories"}
 CANCELLED = set()          # job ids cancelled while running (same-process workers)
 QUEUE_PAUSED = {"paused": False}

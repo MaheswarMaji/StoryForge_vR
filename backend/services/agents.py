@@ -1,6 +1,6 @@
 import json
 
-from services.llm import ask_json, ask_json_fast, ask_json_reasoning, estimate_llm_cost
+from services.llm import ask_json, ask_json_fast, ask_json_reasoning, estimate_llm_cost, pick_creative_model
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -102,7 +102,69 @@ Return ONLY valid JSON."""
     return data, cost
 
 
-# ── Segment regeneration ──────────────────────────────────────────────────────
+# ── Segment an existing script (LLM, CPU) ──────────────────────────────────────
+
+SEGMENT_SYSTEM = (
+    "You are a video pre-production supervisor. You take a WRITER'S EXISTING script (narration, "
+    "dialogue and stage directions) and break it into ~10-second vertical-video scenes WITHOUT "
+    "inventing new plot. You preserve the author's narration and dialogue wording faithfully, build "
+    "one character-consistency sheet, assign the visible cast per scene, and write vivid English "
+    "image/video prompts. You always respond with valid JSON only."
+)
+
+
+async def segment_script(story: dict, channel: dict, target_seconds: int = 90):
+    """Turn a pasted freeform script into a character sheet + per-scene cast/narration/visuals.
+
+    Unlike write_script (which invents a story from a prompt), this preserves the author's
+    existing narration/dialogue and only STRUCTURES it. Runs on a CPU-fit Ollama model.
+    """
+    target_seconds = max(30, min(240, int(target_seconds or 90)))
+    n_chunks = max(3, round(target_seconds / 10))
+    lang = channel.get("language", "hi")
+    source = (story.get("source_text") or "").strip()
+    if not source:
+        raise ValueError("no script text to segment")
+    prompt = f"""Segment the EXISTING script below into a shot list for a ~{target_seconds}s vertical video on channel "{channel.get('name')}".
+
+DO NOT invent a new story or change the plot. Preserve the author's narration/dialogue wording (translate into {lang} ONLY if it is not already in that language). Split long passages and merge tiny ones; aim for about {n_chunks} scenes of ~10 seconds each (may run ±15%).
+
+Return ONLY valid JSON:
+{{
+  "title": "<short title taken from the script>",
+  "characters": [{{"name": "<name>", "description": "<dense VISUAL description: age, face, hair, clothing colors, build, accessories>", "aliases": ["<other spellings>"]}}],
+  "character_sheet": {{"anchor": "<ONE dense paragraph describing EVERY recurring character's exact appearance PLUS the global art style and color palette — reused verbatim for every generated image so characters stay identical>"}},
+  "chunks": [
+    {{
+      "beat": "hook|story|twist|climax|action|lesson",
+      "voiceover": "<the spoken narration/dialogue for this scene, in {lang}, max ~28 words, taken faithfully from the script>",
+      "visual": "<one-line scene summary>",
+      "video_prompt": "<DETAILED English prompt for AI image/video: subject, action, setting, lighting, mood; 9:16 vertical; no text; no watermark>",
+      "camera": "zoom_in|zoom_out|pan_left|pan_right|static",
+      "emotion": "<emotion>",
+      "music_mood": "devotional|suspense|horror|moral|action|sad|happy",
+      "cast": ["<exact character name from the characters list who is PHYSICALLY VISIBLE in this scene>"]
+    }}
+  ]
+}}
+
+RULES:
+- Chunk 1 beat = hook. The last chunk beat = lesson and weaves the CTA "{channel.get('cta_text', '')}" in naturally.
+- "cast" lists ONLY people physically visible in the frame (empty list [] for environment-only scenes). Use the SAME names as in "characters".
+- Visual style for every prompt: {channel.get('style_prefix')}
+- Safety: {"STRICT for kids (7+): gentle, no gore or terror" if channel.get('is_kids') else "General audience 13+"}
+
+SCRIPT:
+{source[:16000]}"""
+    model = pick_creative_model()
+    data = await ask_json(SEGMENT_SYSTEM, prompt, session="segment-script", model=model)
+    cost = estimate_llm_cost(prompt, json.dumps(data, ensure_ascii=False))
+    if not isinstance(data, dict) or not isinstance(data.get("chunks"), list) or not data["chunks"]:
+        raise ValueError("script segmentation returned no scenes")
+    return data, cost
+
+
+
 
 async def regenerate_chunk(story: dict, channel: dict, index: int):
     chunks = (story.get("script") or {}).get("chunks") or []

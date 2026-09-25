@@ -11,7 +11,6 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from services import gemini
-from services.keys import candidate_keys
 from services.ocr import MEDIA_ROOT
 
 SR = 44100
@@ -30,6 +29,7 @@ _FONT_CANDIDATES = {
 }
 
 def _img_tts_keys():
+    from services.llm import candidate_keys
     return candidate_keys()
 
 

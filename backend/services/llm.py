@@ -59,6 +59,30 @@ def is_local_only() -> bool:
     return bool(ollama_url())
 
 
+def _free_ram_gb() -> float:
+    """Best-effort available system RAM in GiB (0.0 if it can't be read)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    return 0.0
+
+
+def pick_creative_model() -> str:
+    """Pick the largest creative model that fits in free CPU RAM.
+
+    qwen2.5:72b needs ~48 GiB resident on CPU; when RAM is tighter we drop to
+    deepseek-r1:32b (~20 GiB).  Every text call runs on CPU (num_gpu=0) so the
+    GPU stays free for the Studio image/video worker.
+    """
+    big   = ollama_main_model()       # qwen2.5:72b
+    small = ollama_reasoning_model()  # deepseek-r1:32b
+    return big if _free_ram_gb() >= 48.0 else small
+
+
 def _select_model(fast: bool = False, reasoning: bool = False, vision: bool = False) -> str:
     if vision:
         return ollama_vision_model()
@@ -82,6 +106,9 @@ async def _ollama_json(system: str, prompt: str, model: str = "") -> dict:
         "model":   _model,
         "stream":  False,
         "format":  "json",
+        "keep_alive": "10m",
+        # CPU-only: the GPU is reserved for the Studio image/video worker.
+        "options": {"num_gpu": 0},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},
@@ -186,7 +213,7 @@ def candidate_keys():
 async def ask_json(system: str, prompt: str, session: str = "job",
                    retries: int = 2, prefer_local: bool = False,
                    fast: bool = False, reasoning: bool = False,
-                   vision: bool = False) -> dict:
+                   vision: bool = False, model: str = "") -> dict:
     """Ask the LLM for a JSON response.
 
     Model selection (Ollama only when OLLAMA_BASE_URL is set):
@@ -202,14 +229,14 @@ async def ask_json(system: str, prompt: str, session: str = "job",
 
     # ── 1. LOCAL OLLAMA ───────────────────────────────────────────────────────
     if ollama_url():
-        model = _select_model(fast=fast, reasoning=reasoning, vision=vision)
+        _model = model or _select_model(fast=fast, reasoning=reasoning, vision=vision)
         for attempt in range(retries + 1):
             try:
-                result = await _ollama_json(system, prompt, model=model)
+                result = await _ollama_json(system, prompt, model=_model)
                 return result
             except Exception as exc:
                 last_err = exc
-                print(f"[llm] ollama {model} attempt {attempt + 1}/{retries + 1}: "
+                print(f"[llm] ollama {_model} attempt {attempt + 1}/{retries + 1}: "
                       f"{str(exc)[:140]}", flush=True)
                 if attempt < retries:
                     await asyncio.sleep(min(4.0, 1.5 ** attempt))
@@ -217,7 +244,7 @@ async def ask_json(system: str, prompt: str, session: str = "job",
         from services.generation import redact
         raise ValueError(
             f"Ollama LLM failed after {retries + 1} attempts "
-            f"(model={model}, url={ollama_url()}): "
+            f"(model={_model}, url={ollama_url()}): "
             f"{redact(last_err) or type(last_err).__name__}. "
             "Ensure Ollama is running and the model is pulled."
         )

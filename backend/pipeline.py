@@ -65,20 +65,28 @@ async def _editor_pass(story_id, story, channel, set_story):
         await _save_cost(story_id, "llm", edit_cost)
         chunks = story["script"]["chunks"]
         applied = 0
+        changed = set()
         for c in (editor.get("corrections") or []):
+            if not isinstance(c, dict):
+                continue
             idx = int(c.get("index", -1))
-            if 0 <= idx < len(chunks) and isinstance(c, dict):
+            if 0 <= idx < len(chunks):
+                touched = False
                 for k in ("voiceover", "visual", "video_prompt"):
-                    if c.get(k):
+                    # diff-check: only invalidate a segment when its text truly changes,
+                    # so re-running produce reuses every already-rendered asset.
+                    if c.get(k) and chunks[idx].get(k) != c[k]:
                         chunks[idx][k] = c[k]
-                applied += 1
+                        changed.add(idx)
+                        touched = True
+                if touched:
+                    applied += 1
         hook_line = editor.get("hook_line") or ""
-        if hook_line and chunks:
+        if hook_line and chunks and chunks[0].get("voiceover") != hook_line:
             chunks[0]["voiceover"] = hook_line
-        if applied or hook_line:
-            import shutil
-            for sub in ("audio", "clips", "frames"):
-                shutil.rmtree(MEDIA_ROOT / sub / story_id, ignore_errors=True)
+            changed.add(0)
+        if changed:
+            _invalidate_caches(story_id, changed)  # only the edited segments re-render
             story["script"]["chunks"] = chunks
         story["script"]["editor"] = {
             "factual_ok": editor.get("factual_ok"),
